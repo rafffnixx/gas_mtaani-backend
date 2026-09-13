@@ -20,9 +20,9 @@ router.get('/dashboard', authenticate, isAgent, async (req, res) => {
       `SELECT
          COUNT(*) FILTER (WHERE status IN ('pending', 'assigned'))          AS new_orders,
          COUNT(*) FILTER (WHERE status = 'accepted')                         AS active_orders,
-         COUNT(*) FILTER (WHERE status = 'confirmed')                        AS completed_orders,
-         COUNT(*) FILTER (WHERE status = 'confirmed' AND DATE(created_at) = CURRENT_DATE) AS today_deliveries,
-         COALESCE(SUM(total_amount) FILTER (WHERE status = 'confirmed' AND DATE(created_at) = CURRENT_DATE), 0) AS today_earnings
+         COUNT(*) FILTER (WHERE status IN ('delivered', 'confirmed'))        AS completed_orders,
+         COUNT(*) FILTER (WHERE status IN ('delivered', 'confirmed') AND DATE(created_at) = CURRENT_DATE) AS today_deliveries,
+         COALESCE(SUM(total_amount) FILTER (WHERE status IN ('delivered', 'confirmed') AND DATE(created_at) = CURRENT_DATE), 0) AS today_earnings
        FROM orders
        WHERE agent_id = $1`,
       [agentId]
@@ -33,8 +33,8 @@ router.get('/dashboard', authenticate, isAgent, async (req, res) => {
       stats: statsResult.rows[0] || {},
     });
   } catch (error) {
-    console.error('Dashboard error:', error);
-    res.status(500).json({ error: 'Failed to fetch dashboard' });
+    console.error('Dashboard error:', error.message, error.detail || '');
+    res.status(500).json({ error: 'Failed to fetch dashboard', detail: error.message });
   }
 });
 
@@ -62,8 +62,8 @@ router.get('/status', authenticate, isAgent, async (req, res) => {
       total_deliveries: agent.total_deliveries || 0,
     });
   } catch (error) {
-    console.error('Status error:', error);
-    res.status(500).json({ error: 'Failed to fetch status' });
+    console.error('Status error:', error.message, error.detail || '');
+    res.status(500).json({ error: 'Failed to fetch status', detail: error.message });
   }
 });
 
@@ -85,8 +85,8 @@ router.put('/online', authenticate, isAgent, async (req, res) => {
       is_online: result.rows[0]?.is_online || false,
     });
   } catch (error) {
-    console.error('Toggle online error:', error);
-    res.status(500).json({ error: 'Failed to update status' });
+    console.error('Toggle online error:', error.message, error.detail || '');
+    res.status(500).json({ error: 'Failed to update status', detail: error.message });
   }
 });
 
@@ -98,13 +98,18 @@ router.get('/inventory', authenticate, isAgent, async (req, res) => {
     const { rows } = await pool.query(
       `SELECT ai.id,
               ai.product_id,
+              ai.stock_quantity,
+              ai.is_available,
+              ai.min_stock_level,
+              ai.max_stock_level,
+              ai.reorder_quantity,
+              ai.price_modifier,
               p.name        AS product_name,
               p.brand_name  AS brand_name,
               p.image_url   AS image_url,
-              p.price       AS price,
               p.weight_kg   AS weight_kg,
-              ai.stock,
-              ai.is_available
+              p.base_price  AS price,
+              p.product_type
        FROM agent_inventory ai
        JOIN products p ON p.id = ai.product_id
        WHERE ai.agent_id = $1
@@ -113,8 +118,8 @@ router.get('/inventory', authenticate, isAgent, async (req, res) => {
     );
     res.json(rows);
   } catch (error) {
-    console.error('Inventory list error:', error);
-    res.status(500).json({ error: 'Failed to fetch inventory' });
+    console.error('Inventory list error:', error.message, error.detail || '');
+    res.status(500).json({ error: 'Failed to fetch inventory', detail: error.message });
   }
 });
 
@@ -128,19 +133,19 @@ router.post('/inventory', authenticate, isAgent, async (req, res) => {
     }
 
     const { rows } = await pool.query(
-      `INSERT INTO agent_inventory (agent_id, product_id, stock, is_available)
+      `INSERT INTO agent_inventory (agent_id, product_id, stock_quantity, is_available)
        VALUES ($1, $2, $3, $4)
        ON CONFLICT (agent_id, product_id)
-       DO UPDATE SET stock = EXCLUDED.stock,
-                     is_available = EXCLUDED.is_available
+       DO UPDATE SET stock_quantity = EXCLUDED.stock_quantity,
+                     is_available   = EXCLUDED.is_available
        RETURNING *`,
       [req.user.id, product_id, qty, !!is_available]
     );
 
     res.json(rows[0]);
   } catch (error) {
-    console.error('Inventory add error:', error);
-    res.status(500).json({ error: 'Failed to add inventory' });
+    console.error('Inventory add error:', error.message, error.detail || '');
+    res.status(500).json({ error: 'Failed to add inventory', detail: error.message });
   }
 });
 
@@ -151,16 +156,16 @@ router.put('/inventory/:id', authenticate, isAgent, async (req, res) => {
 
     await pool.query(
       `UPDATE agent_inventory
-       SET stock = COALESCE($1, stock),
-           is_available = COALESCE($2, is_available)
+       SET stock_quantity = COALESCE($1, stock_quantity),
+           is_available   = COALESCE($2, is_available)
        WHERE id = $3 AND agent_id = $4`,
       [qty, is_available, req.params.id, req.user.id]
     );
 
     res.json({ success: true });
   } catch (error) {
-    console.error('Inventory update error:', error);
-    res.status(500).json({ error: 'Failed to update inventory' });
+    console.error('Inventory update error:', error.message, error.detail || '');
+    res.status(500).json({ error: 'Failed to update inventory', detail: error.message });
   }
 });
 
@@ -172,8 +177,8 @@ router.delete('/inventory/:id', authenticate, isAgent, async (req, res) => {
     );
     res.json({ success: true });
   } catch (error) {
-    console.error('Inventory delete error:', error);
-    res.status(500).json({ error: 'Failed to delete inventory' });
+    console.error('Inventory delete error:', error.message, error.detail || '');
+    res.status(500).json({ error: 'Failed to delete inventory', detail: error.message });
   }
 });
 
@@ -210,8 +215,8 @@ router.get('/earnings', authenticate, isAgent, async (req, res) => {
       transactions: [],
     });
   } catch (error) {
-    console.error('Earnings error:', error);
-    res.status(500).json({ error: 'Failed to fetch earnings' });
+    console.error('Earnings error:', error.message, error.detail || '');
+    res.status(500).json({ error: 'Failed to fetch earnings', detail: error.message });
   }
 });
 
@@ -221,58 +226,77 @@ router.get('/earnings', authenticate, isAgent, async (req, res) => {
 router.get('/orders/new', authenticate, isAgent, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT * FROM orders
-       WHERE status = 'pending'
-       ORDER BY created_at DESC
+      `SELECT o.*,
+              u.full_name AS customer_name,
+              u.phone_number AS customer_phone,
+              p.name        AS product_name,
+              p.brand_name  AS brand_name,
+              p.image_url   AS product_image
+       FROM orders o
+       LEFT JOIN users u    ON u.id = o.customer_id
+       LEFT JOIN products p ON p.id = o.product_id
+       WHERE o.status IN ('pending', 'assigned')
+       ORDER BY o.created_at DESC
        LIMIT 50`
     );
     res.json(rows);
   } catch (error) {
-    console.error('New orders error:', error);
-    res.status(500).json({ error: 'Failed to fetch new orders' });
+    console.error('New orders error:', error.message, error.detail || '');
+    res.status(500).json({ error: 'Failed to fetch new orders', detail: error.message });
   }
 });
 
 router.get('/orders', authenticate, isAgent, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT * FROM orders
-       WHERE agent_id = $1
-       ORDER BY created_at DESC`,
+      `SELECT o.*,
+              u.full_name AS customer_name,
+              u.phone_number AS customer_phone,
+              p.name        AS product_name,
+              p.brand_name  AS brand_name,
+              p.image_url   AS product_image
+       FROM orders o
+       LEFT JOIN users u    ON u.id = o.customer_id
+       LEFT JOIN products p ON p.id = o.product_id
+       WHERE o.agent_id = $1
+       ORDER BY o.created_at DESC`,
       [req.user.id]
     );
     res.json(rows);
   } catch (error) {
-    console.error('Orders error:', error);
-    res.status(500).json({ error: 'Failed to fetch orders' });
+    console.error('Orders error:', error.message, error.detail || '');
+    res.status(500).json({ error: 'Failed to fetch orders', detail: error.message });
   }
 });
 
 router.post('/orders/:id/accept', authenticate, isAgent, async (req, res) => {
   try {
     await pool.query(
-      `UPDATE orders SET agent_id = $1, status = 'accepted'
-       WHERE id = $2 AND status = 'pending'`,
+      `UPDATE orders
+       SET agent_id = $1, status = 'accepted'
+       WHERE id = $2 AND status IN ('pending', 'assigned')`,
       [req.user.id, req.params.id]
     );
     res.json({ success: true });
   } catch (error) {
-    console.error('Accept order error:', error);
-    res.status(500).json({ error: 'Failed to accept order' });
+    console.error('Accept order error:', error.message, error.detail || '');
+    res.status(500).json({ error: 'Failed to accept order', detail: error.message });
   }
 });
 
 router.post('/orders/:id/decline', authenticate, isAgent, async (req, res) => {
   try {
+    const { reason } = req.body;
+    // orders table has no decline_reason column by default — keep the query
+    // to status only unless you add one.
     await pool.query(
-      `UPDATE orders SET status = 'declined', decline_reason = $1
-       WHERE id = $2`,
-      [req.body.reason || null, req.params.id]
+      `UPDATE orders SET status = 'declined' WHERE id = $1`,
+      [req.params.id]
     );
-    res.json({ success: true });
+    res.json({ success: true, reason: reason || null });
   } catch (error) {
-    console.error('Decline order error:', error);
-    res.status(500).json({ error: 'Failed to decline order' });
+    console.error('Decline order error:', error.message, error.detail || '');
+    res.status(500).json({ error: 'Failed to decline order', detail: error.message });
   }
 });
 
@@ -285,22 +309,22 @@ router.post('/orders/:id/pickup', authenticate, isAgent, async (req, res) => {
     );
     res.json({ success: true });
   } catch (error) {
-    console.error('Pickup error:', error);
-    res.status(500).json({ error: 'Failed to mark picked up' });
+    console.error('Pickup error:', error.message, error.detail || '');
+    res.status(500).json({ error: 'Failed to mark picked up', detail: error.message });
   }
 });
 
 router.post('/orders/:id/deliver', authenticate, isAgent, async (req, res) => {
   try {
     await pool.query(
-      `UPDATE orders SET status = 'delivered', delivered_at = NOW()
+      `UPDATE orders SET status = 'delivered'
        WHERE id = $1 AND agent_id = $2`,
       [req.params.id, req.user.id]
     );
     res.json({ success: true });
   } catch (error) {
-    console.error('Deliver error:', error);
-    res.status(500).json({ error: 'Failed to mark delivered' });
+    console.error('Deliver error:', error.message, error.detail || '');
+    res.status(500).json({ error: 'Failed to mark delivered', detail: error.message });
   }
 });
 
@@ -320,8 +344,8 @@ router.post('/withdraw', authenticate, isAgent, async (req, res) => {
     );
     res.json({ success: true });
   } catch (error) {
-    console.error('Withdraw error:', error);
-    res.status(500).json({ error: 'Failed to request withdrawal' });
+    console.error('Withdraw error:', error.message, error.detail || '');
+    res.status(500).json({ error: 'Failed to request withdrawal', detail: error.message });
   }
 });
 
@@ -333,8 +357,8 @@ router.get('/withdrawals', authenticate, isAgent, async (req, res) => {
     );
     res.json(rows);
   } catch (error) {
-    console.error('Withdrawals error:', error);
-    res.status(500).json({ error: 'Failed to fetch withdrawals' });
+    console.error('Withdrawals error:', error.message, error.detail || '');
+    res.status(500).json({ error: 'Failed to fetch withdrawals', detail: error.message });
   }
 });
 

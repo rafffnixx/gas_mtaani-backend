@@ -513,4 +513,80 @@ router.get('/withdrawals', authenticate, isAgent, async (req, res) => {
   }
 });
 
+
+// ================================================================
+// LOCATION  (business location + service area)
+// ================================================================
+router.get('/location', authenticate, isAgent, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT
+         ST_Y(location::geometry) AS lat,
+         ST_X(location::geometry) AS lng,
+         service_radius,
+         county, sub_county, ward, address_line
+       FROM agents WHERE id = $1`,
+      [req.user.id]
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Agent not found' });
+    }
+    res.json(rows[0]);
+  } catch (error) {
+    console.error('Location fetch error:', error.message, error.detail || '');
+    res.status(500).json({ error: 'Failed to fetch location', detail: error.message });
+  }
+});
+
+router.put('/location', authenticate, isAgent, async (req, res) => {
+  try {
+    const {
+      latitude,
+      longitude,
+      service_radius,
+      county,
+      sub_county,
+      ward,
+      address_line,
+    } = req.body;
+
+    const lat = Number(latitude);
+    const lng = Number(longitude);
+
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return res.status(400).json({ error: 'latitude and longitude are required' });
+    }
+    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+      return res.status(400).json({ error: 'latitude/longitude out of range' });
+    }
+
+    const radius = service_radius != null ? Number(service_radius) : 5000;
+
+    const { rows } = await pool.query(
+      `UPDATE agents
+       SET location       = ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
+           service_radius = COALESCE($3, service_radius),
+           county         = COALESCE($4, county),
+           sub_county     = COALESCE($5, sub_county),
+           ward           = COALESCE($6, ward),
+           address_line   = COALESCE($7, address_line),
+           updated_at     = NOW()
+       WHERE id = $8
+       RETURNING
+         ST_Y(location::geometry) AS lat,
+         ST_X(location::geometry) AS lng,
+         service_radius,
+         county, sub_county, ward, address_line`,
+      [lng, lat, radius, county, sub_county, ward, address_line, req.user.id]
+    );
+
+    res.json(rows[0]);
+  } catch (error) {
+    console.error('Location update error:', error.message, error.detail || '');
+    res.status(500).json({ error: 'Failed to update location', detail: error.message });
+  }
+});
+
+
+
 module.exports = router;

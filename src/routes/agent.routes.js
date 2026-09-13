@@ -287,8 +287,6 @@ router.post('/orders/:id/accept', authenticate, isAgent, async (req, res) => {
 router.post('/orders/:id/decline', authenticate, isAgent, async (req, res) => {
   try {
     const { reason } = req.body;
-    // orders table has no decline_reason column by default — keep the query
-    // to status only unless you add one.
     await pool.query(
       `UPDATE orders SET status = 'declined' WHERE id = $1`,
       [req.params.id]
@@ -329,23 +327,176 @@ router.post('/orders/:id/deliver', authenticate, isAgent, async (req, res) => {
 });
 
 // ================================================================
+// PAYOUT DETAILS  (M-PESA + Bank, stored on the agents row)
+// ================================================================
+router.get('/payout-details', authenticate, isAgent, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT mpesa_number, mpesa_name,
+              bank_name, bank_account_name, bank_account_no, bank_branch,
+              preferred_payout,
+              total_earnings, available_balance
+       FROM agents WHERE id = $1`,
+      [req.user.id]
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Agent not found' });
+    }
+    res.json(rows[0]);
+  } catch (error) {
+    console.error('Payout details fetch error:', error.message, error.detail || '');
+    res.status(500).json({ error: 'Failed to fetch payout details', detail: error.message });
+  }
+});
+
+router.put('/payout-details', authenticate, isAgent, async (req, res) => {
+  try {
+    const {
+      mpesa_number,
+      mpesa_name,
+      bank_name,
+      bank_account_name,
+      bank_account_no,
+      bank_branch,
+      preferred_payout,
+    } = req.body;
+
+    if (preferred_payout && !['mpesa', 'bank'].includes(preferred_payout)) {
+      return res.status(400).json({ error: 'preferred_payout must be mpesa or bank' });
+    }
+    if (preferred_payout === 'mpesa' && !mpesa_number) {
+      return res.status(400).json({ error: 'mpesa_number is required when M-PESA is preferred' });
+    }
+    if (preferred_payout === 'bank' && (!bank_name || !bank_account_no)) {
+      return res.status(400).json({ error: 'bank_name and bank_account_no are required when Bank is preferred' });
+    }
+
+    const { rows } = await pool.query(
+      `UPDATE agents
+       SET mpesa_number      = COALESCE($1, mpesa_number),
+           mpesa_name        = COALESCE($2, mpesa_name),
+           bank_name         = COALESCE($3, bank_name),
+           bank_account_name = COALESCE($4, bank_account_name),
+           bank_account_no   = COALESCE($5, bank_account_no),
+           bank_branch       = COALESCE($6, bank_branch),
+           preferred_payout  = COALESCE($7, preferred_payout),
+           updated_at        = NOW()
+       WHERE id = $8
+       RETURNING mpesa_number, mpesa_name,
+                 bank_name, bank_account_name, bank_account_no, bank_branch,
+                 preferred_payout`,
+      [
+        mpesa_number,
+        mpesa_name,
+        bank_name,
+        bank_account_name,
+        bank_account_no,
+        bank_branch,
+        preferred_payout,
+        req.user.id,
+      ]
+    );
+
+    res.json(rows[0]);
+  } catch (error) {
+    console.error('Payout details update error:', error.message, error.detail || '');
+    res.status(500).json({ error: 'Failed to update payout details', detail: error.message });
+  }
+});
+
+// ================================================================
 // WITHDRAWALS
 // ================================================================
 router.post('/withdraw', authenticate, isAgent, async (req, res) => {
+  const client = await pool.connect();
   try {
+    await client.query('BEGIN');
+
     const { amount, method } = req.body;
-    if (!amount || Number(amount) <= 0) {
+    const amt = Number(amount);
+
+    if (!amt || amt <= 0) {
+      await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Invalid amount' });
     }
-    await pool.query(
-      `INSERT INTO withdrawals (agent_id, amount, method, status)
-       VALUES ($1, $2, $3, 'pending')`,
-      [req.user.id, amount, method || 'mpesa']
+
+    // Lock the agent row so two withdrawals can't overspend
+    const { rows } = await client.query(
+      `SELECT available_balance,
+              preferred_payout,
+              mpesa_number, mpesa_name,
+              bank_name, bank_account_name, bank_account_no
+       FROM agents
+       WHERE id = $1
+       FOR UPDATE`,
+      [req.user.id]
     );
-    res.json({ success: true });
+
+    if (rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Agent not found' });
+    }
+
+    const agent = rows[0];
+    const chosen = method || agent.preferred_payout || 'mpesa';
+
+    // Validate destination
+    if (chosen === 'mpesa' && !agent.mpesa_number) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: 'No M-PESA number on file. Add your payout details first.',
+        code: 'no_payout_details',
+      });
+    }
+    if (chosen === 'bank' && (!agent.bank_name || !agent.bank_account_no)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: 'No bank account on file. Add your payout details first.',
+        code: 'no_payout_details',
+      });
+    }
+
+    // Check balance
+    if (amt > Number(agent.available_balance || 0)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: `Insufficient balance. Available: KES ${Number(agent.available_balance || 0).toLocaleString()}`,
+        code: 'insufficient_balance',
+      });
+    }
+
+    // Snapshot the destination
+    const dest = chosen === 'mpesa'
+      ? { name: agent.mpesa_name, number: agent.mpesa_number, bank: null }
+      : { name: agent.bank_account_name, number: agent.bank_account_no, bank: agent.bank_name };
+
+    // Insert withdrawal
+    const w = await client.query(
+      `INSERT INTO withdrawals
+         (agent_id, amount, method, status,
+          account_name, account_number, bank_name, created_at)
+       VALUES ($1, $2, $3, 'pending', $4, $5, $6, NOW())
+       RETURNING *`,
+      [req.user.id, amt, chosen, dest.name, dest.number, dest.bank]
+    );
+
+    // Hold the funds — subtract now, admin marks paid later
+    await client.query(
+      `UPDATE agents
+       SET available_balance = available_balance - $1,
+           updated_at        = NOW()
+       WHERE id = $2`,
+      [amt, req.user.id]
+    );
+
+    await client.query('COMMIT');
+    res.json({ success: true, withdrawal: w.rows[0] });
   } catch (error) {
+    await client.query('ROLLBACK');
     console.error('Withdraw error:', error.message, error.detail || '');
     res.status(500).json({ error: 'Failed to request withdrawal', detail: error.message });
+  } finally {
+    client.release();
   }
 });
 

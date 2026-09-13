@@ -589,4 +589,86 @@ router.put('/location', authenticate, isAgent, async (req, res) => {
 
 
 
+// ================================================================
+// BUSINESS PROFILE  (edit business info)
+// ================================================================
+router.get('/business', authenticate, isAgent, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT business_name,
+              business_registration_number,
+              kra_pin,
+              id_number,
+              business_license_url,
+              profile_photo_url,
+              service_radius,
+              is_approved,
+              approval_date
+       FROM agents WHERE id = $1`,
+      [req.user.id]
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Agent not found' });
+    }
+    res.json(rows[0]);
+  } catch (error) {
+    console.error('Business fetch error:', error.message, error.detail || '');
+    res.status(500).json({ error: 'Failed to fetch business info', detail: error.message });
+  }
+});
+
+router.put('/business', authenticate, isAgent, async (req, res) => {
+  try {
+    const {
+      business_name,
+      business_registration_number,
+      kra_pin,
+      id_number,
+      profile_photo_url,
+    } = req.body;
+
+    if (!business_name || !business_name.trim()) {
+      return res.status(400).json({ error: 'business_name is required' });
+    }
+    if (business_name.length > 255) {
+      return res.status(400).json({ error: 'business_name too long (max 255)' });
+    }
+    if (kra_pin && !/^[A-Z]\d{9}[A-Z]$/i.test(kra_pin.trim())) {
+      return res.status(400).json({ error: 'KRA PIN must be in the format A123456789B' });
+    }
+
+    const { rows } = await pool.query(
+      `UPDATE agents
+       SET business_name                = COALESCE($1, business_name),
+           business_registration_number = COALESCE($2, business_registration_number),
+           kra_pin                      = COALESCE($3, kra_pin),
+           id_number                    = COALESCE($4, id_number),
+           profile_photo_url            = COALESCE($5, profile_photo_url),
+           updated_at                   = NOW()
+       WHERE id = $6
+       RETURNING business_name,
+                 business_registration_number,
+                 kra_pin,
+                 id_number,
+                 business_license_url,
+                 profile_photo_url`,
+      [
+        business_name.trim(),
+        business_registration_number?.trim() || null,
+        kra_pin?.trim() || null,
+        id_number?.trim() || null,
+        profile_photo_url || null,
+        req.user.id,
+      ]
+    );
+
+    res.json(rows[0]);
+  } catch (error) {
+    console.error('Business update error:', error.message, error.detail || '');
+    res.status(500).json({ error: 'Failed to update business info', detail: error.message });
+  }
+});
+
+
+
 module.exports = router;

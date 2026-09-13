@@ -1,0 +1,27 @@
+﻿# dependencies
+node_modules/
+package-lock.json.bak
+
+# env
+.env
+.env.*
+!.env.example
+
+# SQL dumps / backups
+*.sql
+*.dump
+*.bak
+
+# logs
+*.log
+npm-debug.log*
+yarn-error.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# editors
+.vscode/
+.idea/
+*.swp

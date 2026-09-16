@@ -27,9 +27,6 @@ const allowedOrigins = [
 
   // Production admin panel
   'https://admingasmtaani.vercel.app',
-
-  // Add more deployment URLs here if you create preview builds, e.g.:
-  // 'https://admingasmtaani-git-main-rafffnixx.vercel.app',
 ];
 
 app.use(cors({
@@ -43,7 +40,6 @@ app.use(cors({
     }
 
     // Allow any Vercel preview URL for this project
-    // (preview deployments get random subdomains like admingasmtaani-abc123.vercel.app)
     if (/^https:\/\/admingasmtaani[a-z0-9-]*\.vercel\.app$/.test(origin)) {
       return callback(null, true);
     }
@@ -64,12 +60,17 @@ app.use(express.urlencoded({ extended: true }));
 // ============================================
 // Routes
 // ============================================
-const authRoutes    = require('./routes/auth.routes');
-const productRoutes = require('./routes/product.routes');
-const agentRoutes   = require('./routes/agent.routes');
-const orderRoutes   = require('./routes/order.routes');
-const adminRoutes   = require('./routes/admin.routes');
+const authRoutes      = require('./routes/auth.routes');
+const adminAuthRoutes = require('./routes/adminAuth.routes');  // 👈 NEW
+const productRoutes   = require('./routes/product.routes');
+const agentRoutes     = require('./routes/agent.routes');
+const orderRoutes     = require('./routes/order.routes');
+const adminRoutes     = require('./routes/admin.routes');
 
+// Mount admin auth BEFORE /api/admin so /api/admin/auth/* takes priority
+app.use('/api/admin/auth', adminAuthRoutes);
+
+// Existing routes
 app.use('/api/auth',     authRoutes);
 app.use('/api/products', productRoutes);
 app.use('/api/agents',   agentRoutes);
@@ -105,9 +106,13 @@ app.use((err, req, res, next) => {
   });
 });
 
+// ============================================
+// Start server
+// ============================================
 app.listen(PORT, () => {
   console.log(`🚀 Gas Mtaani API running on port ${PORT}`);
   console.log(`📡 http://localhost:${PORT}`);
   console.log(`📋 Health check: http://localhost:${PORT}/api/health`);
+  console.log(`🔑 Admin auth:   http://localhost:${PORT}/api/admin/auth`);
   console.log(`🔑 Admin routes: http://localhost:${PORT}/api/admin`);
 });

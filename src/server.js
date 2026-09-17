@@ -61,7 +61,8 @@ app.use(express.urlencoded({ extended: true }));
 // Routes
 // ============================================
 const authRoutes      = require('./routes/auth.routes');
-const adminAuthRoutes = require('./routes/adminAuth.routes');  // 👈 NEW
+const adminAuthRoutes = require('./routes/adminAuth.routes');
+const customerRoutes  = require('./routes/customer.routes');   // 👈 NEW
 const productRoutes   = require('./routes/product.routes');
 const agentRoutes     = require('./routes/agent.routes');
 const orderRoutes     = require('./routes/order.routes');
@@ -71,11 +72,12 @@ const adminRoutes     = require('./routes/admin.routes');
 app.use('/api/admin/auth', adminAuthRoutes);
 
 // Existing routes
-app.use('/api/auth',     authRoutes);
-app.use('/api/products', productRoutes);
-app.use('/api/agents',   agentRoutes);
-app.use('/api/orders',   orderRoutes);
-app.use('/api/admin',    adminRoutes);
+app.use('/api/auth',      authRoutes);
+app.use('/api/customers', customerRoutes);   // 👈 NEW
+app.use('/api/products',  productRoutes);
+app.use('/api/agents',    agentRoutes);
+app.use('/api/orders',    orderRoutes);
+app.use('/api/admin',     adminRoutes);
 
 // ============================================
 // Health check
@@ -114,5 +116,6 @@ app.listen(PORT, () => {
   console.log(`📡 http://localhost:${PORT}`);
   console.log(`📋 Health check: http://localhost:${PORT}/api/health`);
   console.log(`🔑 Admin auth:   http://localhost:${PORT}/api/admin/auth`);
+  console.log(`👤 Customers:    http://localhost:${PORT}/api/customers`);
   console.log(`🔑 Admin routes: http://localhost:${PORT}/api/admin`);
 });

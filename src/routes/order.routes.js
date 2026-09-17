@@ -5,7 +5,7 @@ const { pool } = require('../config/database');
 const { authenticate, isAgent } = require('../middleware/auth.middleware');
 
 // =====================================================
-// CREATE ORDER (Customer)
+// CREATE ORDER (Customer) — supports single or multi-item
 // =====================================================
 router.post('/', authenticate, async (req, res) => {
   const client = await pool.connect();
@@ -14,101 +14,202 @@ router.post('/', authenticate, async (req, res) => {
 
     const customerId = req.user.id;
     const {
+      // multi-item
+      items,
+      // single-item (backwards compat)
       product_id,
       quantity = 1,
+      // delivery
       delivery_address,
       customer_latitude,
       customer_longitude,
       special_instructions,
+      payment_method,
+      // location hierarchy
+      location_source,
+      county_code,
+      constituency_code,
+      ward_code,
+      area_name,
+      landmark,
+      customer_address_id,
     } = req.body;
 
-    if (!product_id || !delivery_address || !customer_latitude || !customer_longitude) {
+    // ---- Normalize items ----
+    const normalizedItems =
+      Array.isArray(items) && items.length > 0
+        ? items.map((it) => ({
+            product_id: it.product_id || it.id,
+            quantity: Number(it.quantity) || 1,
+          }))
+        : product_id
+        ? [{ product_id, quantity: Number(quantity) || 1 }]
+        : [];
+
+    if (!normalizedItems.length || !delivery_address) {
       await client.query('ROLLBACK');
       return res.status(400).json({
-        error: 'Missing required fields: product_id, delivery_address, customer_latitude, customer_longitude',
+        error: 'Missing required fields: items[] (or product_id) and delivery_address',
       });
     }
 
-    // Product lookup
-    const productResult = await client.query(
-      'SELECT * FROM products WHERE id = $1 AND is_active = true',
-      [product_id]
-    );
-    if (productResult.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Product not found or inactive' });
-    }
-    const product = productResult.rows[0];
+    // GPS is optional now (manual / WhatsApp-pin paths have no coords)
+    const hasCoords =
+      customer_latitude != null &&
+      customer_longitude != null &&
+      !Number.isNaN(Number(customer_latitude)) &&
+      !Number.isNaN(Number(customer_longitude));
 
-    // Nearest agent (requires the find_nearest_agents SQL function)
-    const agentResult = await client.query(
-      `SELECT * FROM find_nearest_agents($1, $2, $3, 5000, 1)`,
-      [customer_latitude, customer_longitude, product_id]
+    // ---- Resolve all products ----
+    const productIds = [...new Set(normalizedItems.map((i) => i.product_id))];
+    const productsRes = await client.query(
+      `SELECT id, name, base_price
+       FROM products
+       WHERE id = ANY($1::uuid[]) AND is_active = true`,
+      [productIds]
     );
-    if (agentResult.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({
-        error: 'No available agents within your area. Please try again later.',
-      });
-    }
-    const agent = agentResult.rows[0];
+    const productsById = Object.fromEntries(productsRes.rows.map((p) => [p.id, p]));
 
-    // Delivery fee: 10 KES/km, min 50, max 100
-    const distance = parseFloat(agent.distance_km) || 0;
-    let deliveryFee = distance * 10;
-    deliveryFee = Math.max(50, Math.min(100, deliveryFee));
+    for (const it of normalizedItems) {
+      if (!productsById[it.product_id]) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({
+          error: `Product not found or inactive: ${it.product_id}`,
+        });
+      }
+    }
+
+    // ---- Subtotal ----
+    let subtotal = 0;
+    for (const it of normalizedItems) {
+      subtotal += Number(productsById[it.product_id].base_price) * it.quantity;
+    }
+
+    // ---- Nearest agent (only when coords available) ----
+    let agent = null;
+    let deliveryFee = 100; // flat fallback
+
+    if (hasCoords) {
+      const anchorProductId = normalizedItems[0].product_id;
+      const agentResult = await client.query(
+        `SELECT * FROM find_nearest_agents($1, $2, $3, 5000, 1)`,
+        [customer_latitude, customer_longitude, anchorProductId]
+      );
+
+      if (agentResult.rows.length > 0) {
+        agent = agentResult.rows[0];
+        const distance = parseFloat(agent.distance_km) || 0;
+        deliveryFee = Math.max(50, Math.min(100, distance * 10));
+      } else {
+        console.warn(
+          `No agent found near ${customer_latitude},${customer_longitude} for product ${anchorProductId}`
+        );
+      }
+    }
 
     const orderNumber = `GM-${Date.now().toString().slice(-8)}`;
-    const totalAmount = product.base_price * quantity + deliveryFee;
+    const totalAmount = subtotal + deliveryFee;
+
+    // Legacy single-item fields on `orders` — keep first item for old code paths
+    const firstItem = normalizedItems[0];
+    const firstProduct = productsById[firstItem.product_id];
+    const orderStatus = agent ? 'assigned' : 'pending';
 
     const orderResult = await client.query(
       `INSERT INTO orders (
-         order_number, customer_id, agent_id, product_id,
-         quantity, product_price, delivery_fee, total_amount,
+         order_number, customer_id, agent_id,
+         product_id, quantity, product_price,
+         delivery_fee, total_amount,
          customer_latitude, customer_longitude, delivery_address,
-         special_instructions, status, assigned_at, created_at, updated_at
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'assigned',NOW(),NOW(),NOW())
+         special_instructions,
+         payment_method,
+         location_source, county_code, constituency_code, ward_code,
+         area_name, landmark, customer_address_id,
+         status, assigned_at, created_at, updated_at
+       ) VALUES (
+         $1,$2,$3,
+         $4,$5,$6,
+         $7,$8,
+         $9,$10,$11,
+         $12,
+         $13,
+         $14,$15,$16,$17,
+         $18,$19,$20,
+         $21,
+         CASE WHEN $3::uuid IS NULL THEN NULL ELSE NOW() END,
+         NOW(), NOW()
+       )
        RETURNING *`,
       [
         orderNumber,
         customerId,
-        agent.agent_id,
-        product_id,
-        quantity,
-        product.base_price,
+        agent ? agent.agent_id : null,
+        firstItem.product_id,
+        firstItem.quantity,
+        firstProduct.base_price,
         deliveryFee,
         totalAmount,
-        customer_latitude,
-        customer_longitude,
+        hasCoords ? customer_latitude : null,
+        hasCoords ? customer_longitude : null,
         delivery_address,
         special_instructions || null,
+        payment_method || 'mpesa',
+        location_source || null,
+        county_code || null,
+        constituency_code || null,
+        ward_code || null,
+        area_name || null,
+        landmark || null,
+        customer_address_id || null,
+        orderStatus,
       ]
     );
 
-    // Bump the agent's in-flight counter. Stock is NOT deducted here —
-    // only on accept, per the flow we agreed on.
-    await client.query(
-      'UPDATE agents SET current_order_count = current_order_count + 1, updated_at = NOW() WHERE id = $1',
-      [agent.agent_id]
-    );
+    const order = orderResult.rows[0];
+
+    // ---- Persist all line items ----
+    for (const it of normalizedItems) {
+      await client.query(
+        `INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+         VALUES ($1, $2, $3, $4)`,
+        [order.id, it.product_id, it.quantity, productsById[it.product_id].base_price]
+      );
+    }
+
+    // ---- Bump agent load ----
+    if (agent) {
+      await client.query(
+        `UPDATE agents
+         SET current_order_count = current_order_count + 1,
+             updated_at          = NOW()
+         WHERE id = $1`,
+        [agent.agent_id]
+      );
+    }
 
     await client.query('COMMIT');
 
     res.status(201).json({
       success: true,
       message: 'Order placed successfully',
-      order: orderResult.rows[0],
-      agent: {
-        id: agent.agent_id,
-        business_name: agent.business_name,
-        distance_km: agent.distance_km,
-        rating: agent.rating,
-      },
+      order,
+      items: normalizedItems,
+      agent: agent
+        ? {
+            id: agent.agent_id,
+            business_name: agent.business_name,
+            distance_km: agent.distance_km,
+            rating: agent.rating,
+          }
+        : null,
     });
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Create order error:', error);
-    res.status(500).json({ error: 'Failed to create order', details: error.message });
+    res.status(500).json({
+      error: 'Failed to create order',
+      details: error.message,
+    });
   } finally {
     client.release();
   }
@@ -129,7 +230,7 @@ router.get('/customer', authenticate, async (req, res) => {
               a.business_name AS agent_business,
               u.full_name     AS agent_name
        FROM orders o
-       JOIN products p ON o.product_id = p.id
+       LEFT JOIN products p ON o.product_id = p.id
        LEFT JOIN agents a ON o.agent_id = a.id
        LEFT JOIN users u  ON a.id = u.id
        WHERE o.customer_id = $1
@@ -145,7 +246,7 @@ router.get('/customer', authenticate, async (req, res) => {
 });
 
 // =====================================================
-// GET ORDER DETAILS (customer's own)
+// GET ORDER DETAILS (customer's own) — includes line items
 // =====================================================
 router.get('/:orderId', authenticate, async (req, res) => {
   try {
@@ -161,7 +262,7 @@ router.get('/:orderId', authenticate, async (req, res) => {
               u.full_name     AS agent_name,
               u.phone_number  AS agent_phone
        FROM orders o
-       JOIN products p ON o.product_id = p.id
+       LEFT JOIN products p ON o.product_id = p.id
        LEFT JOIN agents a ON o.agent_id = a.id
        LEFT JOIN users u  ON a.id = u.id
        WHERE o.id = $1 AND o.customer_id = $2`,
@@ -172,7 +273,21 @@ router.get('/:orderId', authenticate, async (req, res) => {
       return res.status(404).json({ error: 'Order not found' });
     }
 
-    res.json(result.rows[0]);
+    // Fetch all line items for this order
+    const itemsRes = await pool.query(
+      `SELECT oi.id, oi.product_id, oi.quantity, oi.unit_price,
+              p.name AS product_name, p.brand_name, p.image_url
+       FROM order_items oi
+       JOIN products p ON oi.product_id = p.id
+       WHERE oi.order_id = $1
+       ORDER BY oi.created_at ASC`,
+      [orderId]
+    );
+
+    res.json({
+      ...result.rows[0],
+      items: itemsRes.rows,
+    });
   } catch (error) {
     console.error('Order detail error:', error);
     res.status(500).json({ error: 'Failed to fetch order details' });
@@ -180,7 +295,7 @@ router.get('/:orderId', authenticate, async (req, res) => {
 });
 
 // =====================================================
-// ACCEPT ORDER (Agent) — deducts stock
+// ACCEPT ORDER (Agent) — deducts stock for every item
 // =====================================================
 router.put('/:orderId/accept', authenticate, isAgent, async (req, res) => {
   const client = await pool.connect();
@@ -213,48 +328,62 @@ router.put('/:orderId/accept', authenticate, isAgent, async (req, res) => {
       });
     }
 
-    const invRes = await client.query(
-      `SELECT id, stock_quantity, is_available
-       FROM agent_inventory
-       WHERE agent_id = $1 AND product_id = $2
-       FOR UPDATE`,
-      [agentId, order.product_id]
+    // Get all line items for this order
+    const itemsRes = await client.query(
+      `SELECT product_id, quantity FROM order_items WHERE order_id = $1`,
+      [orderId]
     );
-    if (invRes.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({
-        error: 'You do not have this product in your inventory',
-        code: 'no_inventory',
-      });
-    }
-    const inv = invRes.rows[0];
+    let lineItems = itemsRes.rows;
 
-    if (!inv.is_available) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({
-        error: 'This product is marked unavailable in your inventory',
-        code: 'not_available',
-      });
-    }
-    if (inv.stock_quantity < order.quantity) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({
-        error: `Not enough stock. You have ${inv.stock_quantity}, order needs ${order.quantity}.`,
-        code: 'insufficient_stock',
-        available: inv.stock_quantity,
-        required: order.quantity,
-      });
+    // Fallback for legacy orders that only have the first item on `orders`
+    if (lineItems.length === 0) {
+      lineItems = [{ product_id: order.product_id, quantity: order.quantity }];
     }
 
-    // Deduct stock
-    await client.query(
-      `UPDATE agent_inventory
-       SET stock_quantity = stock_quantity - $1,
-           is_available   = CASE WHEN stock_quantity - $1 <= 0 THEN false ELSE is_available END,
-           updated_at     = NOW()
-       WHERE id = $2`,
-      [order.quantity, inv.id]
-    );
+    // Check & deduct stock for every line
+    for (const it of lineItems) {
+      const invRes = await client.query(
+        `SELECT id, stock_quantity, is_available
+         FROM agent_inventory
+         WHERE agent_id = $1 AND product_id = $2
+         FOR UPDATE`,
+        [agentId, it.product_id]
+      );
+      if (invRes.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          error: `You do not have product ${it.product_id} in your inventory`,
+          code: 'no_inventory',
+        });
+      }
+      const inv = invRes.rows[0];
+
+      if (!inv.is_available) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          error: `Product ${it.product_id} is marked unavailable in your inventory`,
+          code: 'not_available',
+        });
+      }
+      if (inv.stock_quantity < it.quantity) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          error: `Not enough stock for product ${it.product_id}. You have ${inv.stock_quantity}, order needs ${it.quantity}.`,
+          code: 'insufficient_stock',
+          available: inv.stock_quantity,
+          required: it.quantity,
+        });
+      }
+
+      await client.query(
+        `UPDATE agent_inventory
+         SET stock_quantity = stock_quantity - $1,
+             is_available   = CASE WHEN stock_quantity - $1 <= 0 THEN false ELSE is_available END,
+             updated_at     = NOW()
+         WHERE id = $2`,
+        [it.quantity, inv.id]
+      );
+    }
 
     const updated = await client.query(
       `UPDATE orders
@@ -271,7 +400,7 @@ router.put('/:orderId/accept', authenticate, isAgent, async (req, res) => {
       success: true,
       message: 'Order accepted',
       order: updated.rows[0],
-      stock_remaining: inv.stock_quantity - order.quantity,
+      items_accepted: lineItems.length,
     });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -333,7 +462,6 @@ router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
       [reason.trim(), orderId]
     );
 
-    // Release the agent's slot
     await client.query(
       `UPDATE agents
        SET current_order_count = GREATEST(0, current_order_count - 1),
@@ -384,7 +512,7 @@ router.put('/:orderId/deliver', authenticate, isAgent, async (req, res) => {
 
 // =====================================================
 // CANCEL ORDER BY AGENT — from Active tab
-// Reason required. Stock restored.
+// Reason required. Stock restored for every line.
 // =====================================================
 router.put('/:orderId/cancel-by-agent', authenticate, isAgent, async (req, res) => {
   const client = await pool.connect();
@@ -423,15 +551,27 @@ router.put('/:orderId/cancel-by-agent', authenticate, isAgent, async (req, res) 
       });
     }
 
-    // Restore stock
-    await client.query(
-      `UPDATE agent_inventory
-       SET stock_quantity = stock_quantity + $1,
-           is_available   = true,
-           updated_at     = NOW()
-       WHERE agent_id = $2 AND product_id = $3`,
-      [order.quantity, agentId, order.product_id]
+    // Get all line items for this order
+    const itemsRes = await client.query(
+      `SELECT product_id, quantity FROM order_items WHERE order_id = $1`,
+      [orderId]
     );
+    let lineItems = itemsRes.rows;
+    if (lineItems.length === 0) {
+      lineItems = [{ product_id: order.product_id, quantity: order.quantity }];
+    }
+
+    // Restore stock for every line
+    for (const it of lineItems) {
+      await client.query(
+        `UPDATE agent_inventory
+         SET stock_quantity = stock_quantity + $1,
+             is_available   = true,
+             updated_at     = NOW()
+         WHERE agent_id = $2 AND product_id = $3`,
+        [it.quantity, agentId, it.product_id]
+      );
+    }
 
     const result = await client.query(
       `UPDATE orders
@@ -444,7 +584,6 @@ router.put('/:orderId/cancel-by-agent', authenticate, isAgent, async (req, res) 
       [reason.trim(), orderId]
     );
 
-    // Release the slot
     await client.query(
       `UPDATE agents
        SET current_order_count = GREATEST(0, current_order_count - 1),
@@ -543,7 +682,7 @@ router.put('/:orderId/confirm', authenticate, async (req, res) => {
 
 // =====================================================
 // CANCEL ORDER (Customer)
-// If the agent already accepted, restore stock.
+// If the agent already accepted, restore stock for every line.
 // =====================================================
 router.put('/:orderId/cancel', authenticate, async (req, res) => {
   const client = await pool.connect();
@@ -579,14 +718,25 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
 
     // Restore stock if the agent had already accepted
     if (order.agent_id && order.status === 'accepted') {
-      await client.query(
-        `UPDATE agent_inventory
-         SET stock_quantity = stock_quantity + $1,
-             is_available   = true,
-             updated_at     = NOW()
-         WHERE agent_id = $2 AND product_id = $3`,
-        [order.quantity, order.agent_id, order.product_id]
+      const itemsRes = await client.query(
+        `SELECT product_id, quantity FROM order_items WHERE order_id = $1`,
+        [orderId]
       );
+      let lineItems = itemsRes.rows;
+      if (lineItems.length === 0) {
+        lineItems = [{ product_id: order.product_id, quantity: order.quantity }];
+      }
+
+      for (const it of lineItems) {
+        await client.query(
+          `UPDATE agent_inventory
+           SET stock_quantity = stock_quantity + $1,
+               is_available   = true,
+               updated_at     = NOW()
+           WHERE agent_id = $2 AND product_id = $3`,
+          [it.quantity, order.agent_id, it.product_id]
+        );
+      }
 
       await client.query(
         `UPDATE agents

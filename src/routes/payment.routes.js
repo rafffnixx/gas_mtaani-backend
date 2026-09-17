@@ -4,28 +4,42 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/database');
 const { authenticate } = require('../middleware/auth.middleware');
-const { initialisePesapal } = require('pesapal3-sdk');
 
-// Initialize the Pesapal instance
-const pesapal = initialisePesapal({
-  PESAPAL_ENVIRONMENT: process.env.PESAPAL_ENV || 'sandbox',
-  PESAPAL_CONSUMER_KEY: process.env.PESAPAL_CONSUMER_KEY,
-  PESAPAL_CONSUMER_SECRET: process.env.PESAPAL_CONSUMER_SECRET,
-  PESAPAL_IPN_URL: 'https://gas-mtaani-backend.onrender.com/api/payments/pesapal/ipn',
+// -----------------------------------------------------------
+// Pesapal v3 client (pesapal-v3-node)
+// -----------------------------------------------------------
+const Pesapal = require('pesapal-v3-node');
+
+const pesapalEnv =
+  (process.env.PESAPAL_ENVIRONMENT || 'sandbox').toLowerCase() === 'production'
+    ? 'production'
+    : 'sandbox';
+
+const pesapal = new Pesapal({
+  consumerKey: process.env.PESAPAL_CONSUMER_KEY,
+  consumerSecret: process.env.PESAPAL_CONSUMER_SECRET,
+  environment: pesapalEnv,
 });
+
+const PUBLIC_BASE_URL =
+  process.env.PUBLIC_BASE_URL || 'https://gas-mtaani-backend.onrender.com';
 
 // =====================================================
 // POST /api/payments/pesapal/initiate
-// Called by the mobile app to get a redirect URL
 // =====================================================
 router.post('/pesapal/initiate', authenticate, async (req, res) => {
   try {
     const { orderId } = req.body;
     const userId = req.user.id;
 
-    // 1. Fetch the order from your DB
+    if (!orderId) {
+      return res.status(400).json({ error: 'orderId is required' });
+    }
+
     const orderResult = await pool.query(
-      `SELECT id, order_number, total_amount FROM orders WHERE id = $1 AND customer_id = $2`,
+      `SELECT id, order_number, total_amount, payment_status
+       FROM orders
+       WHERE id = $1 AND customer_id = $2`,
       [orderId, userId]
     );
 
@@ -34,115 +48,164 @@ router.post('/pesapal/initiate', authenticate, async (req, res) => {
     }
     const order = orderResult.rows[0];
 
-    // 2. Fetch customer details for Pesapal billing
+    if (order.payment_status === 'paid') {
+      return res.status(400).json({ error: 'Order is already paid' });
+    }
+
     const userResult = await pool.query(
       `SELECT email, phone_number, full_name FROM users WHERE id = $1`,
       [userId]
     );
-    const user = userResult.rows[0];
+    const user = userResult.rows[0] || {};
 
-    // 3. Build the order details for Pesapal
-    const paymentDetails = {
-      amount: parseFloat(order.total_amount),
+    const nameParts = (user.full_name || 'Gas Mtaani Customer').split(' ');
+    const firstName = nameParts[0] || 'Customer';
+    const lastName = nameParts.slice(1).join(' ') || 'User';
+
+    const result = await pesapal.submitOrderRequest({
+      id: order.order_number,
       currency: 'KES',
+      amount: Number(order.total_amount),
       description: `Gas Mtaani Order ${order.order_number}`,
-      callback_url: `https://gas-mtaani-backend.onrender.com/api/payments/pesapal/callback`,
+      callback_url: `${PUBLIC_BASE_URL}/api/payments/pesapal/callback`,
       notification_id: process.env.PESAPAL_IPN_ID,
       billing_address: {
         email_address: user.email || 'customer@gasmtaani.co.ke',
-        phone_number: user.phone_number,
-        first_name: user.full_name.split(' ')[0] || 'Customer',
-        last_name: user.full_name.split(' ')[1] || 'User',
+        phone_number: user.phone_number || '254700000000',
+        first_name: firstName,
+        last_name: lastName,
       },
-    };
+    });
 
-    // 4. Submit to Pesapal
-    const ordered = await pesapal.submitOrder(paymentDetails);
+    const trackingId = result?.order_tracking_id;
+    const redirectUrl = result?.redirect_url;
 
-    if (ordered.success) {
-      // 5. Save the tracking ID against the order
-      const trackingId = ordered.response.order_tracking_id;
-      await pool.query(
-        `UPDATE orders 
-         SET payment_reference = $1, payment_status = 'pending', payment_method = 'pesapal'
-         WHERE id = $2`,
-        [trackingId, orderId]
-      );
-
-      return res.json({
-        success: true,
-        redirectUrl: ordered.response.redirect_url,
-        orderTrackingId: trackingId,
+    if (!trackingId || !redirectUrl) {
+      console.error('Pesapal submitOrderRequest unexpected response:', result);
+      return res.status(502).json({
+        error: 'Payment initiation failed',
+        details: result,
       });
-    } else {
-      console.error('Pesapal submission error:', ordered.error);
-      return res.status(400).json({ error: 'Payment initiation failed', details: ordered.error });
     }
+
+    await pool.query(
+      `UPDATE orders
+       SET payment_reference = $1,
+           payment_status = 'pending',
+           payment_method = 'pesapal'
+       WHERE id = $2`,
+      [trackingId, orderId]
+    );
+
+    return res.json({
+      success: true,
+      orderTrackingId: trackingId,
+      redirectUrl,
+    });
   } catch (error) {
-    console.error('Pesapal initiate error:', error);
-    res.status(500).json({ error: 'Internal server error', details: error.message });
+    console.error('Pesapal initiate error:', error?.response?.data || error);
+    res.status(500).json({
+      error: 'Failed to initiate Pesapal payment',
+      details: error?.response?.data?.message || error.message,
+    });
   }
 });
 
 // =====================================================
 // GET /api/payments/pesapal/callback
-// User is redirected here after payment on Pesapal's page
 // =====================================================
 router.get('/pesapal/callback', async (req, res) => {
-  // Pesapal sends the customer here. We just redirect them back to the app.
-  // The actual verification happens via the IPN below.
-  const { OrderTrackingId, OrderMerchantReference } = req.query;
+  try {
+    const { OrderTrackingId, OrderMerchantReference } = req.query;
 
-  // Deep link back to your mobile app (adjust 'gasmtaani://' to your scheme)
-  const appRedirect = `gasmtaani://payment-result?trackingId=${OrderTrackingId}&orderId=${OrderMerchantReference}`;
-  
-  res.redirect(appRedirect);
+    if (OrderTrackingId) {
+      try {
+        const status = await pesapal.getTransactionStatus(OrderTrackingId);
+        const desc = status?.payment_status_description;
+
+        if (desc === 'Completed') {
+          await pool.query(
+            `UPDATE orders
+             SET payment_status = 'paid',
+                 mpesa_transaction_id = COALESCE($1, mpesa_transaction_id)
+             WHERE payment_reference = $2`,
+            [status?.confirmation_code || null, OrderTrackingId]
+          );
+        } else if (['Failed', 'Invalid', 'Reversed'].includes(desc)) {
+          await pool.query(
+            `UPDATE orders SET payment_status = 'failed' WHERE payment_reference = $1`,
+            [OrderTrackingId]
+          );
+        }
+      } catch (verifyErr) {
+        console.warn(
+          'Pesapal callback verify failed:',
+          verifyErr?.response?.data || verifyErr.message
+        );
+      }
+    }
+
+    const deepLink = `gasmtaani://payment-result?trackingId=${
+      OrderTrackingId || ''
+    }&orderId=${OrderMerchantReference || ''}`;
+    res.redirect(deepLink);
+  } catch (error) {
+    console.error('Pesapal callback error:', error);
+    res.status(500).send('Payment callback failed');
+  }
 });
 
 // =====================================================
 // GET /api/payments/pesapal/ipn
-// Silent server-to-server notification from Pesapal
-// This is where you update the DB reliably.
 // =====================================================
 router.get('/pesapal/ipn', async (req, res) => {
   try {
-    const { OrderTrackingId, OrderMerchantReference, OrderNotificationType } = req.query;
+    const {
+      OrderTrackingId,
+      OrderMerchantReference,
+      OrderNotificationType,
+    } = req.query;
 
-    // 1. Verify the transaction status with Pesapal (Do not trust the query params alone)
-    const statusResponse = await pesapal.getTransactionStatus(OrderTrackingId);
-
-    if (statusResponse.success) {
-      const statusData = statusResponse.response;
-      
-      if (statusData.payment_status_description === 'Completed') {
-        // 2. Mark order as paid
-        await pool.query(
-          `UPDATE orders 
-           SET payment_status = 'paid', mpesa_transaction_id = $1
-           WHERE id = $2`,
-          [statusData.confirmation_code, OrderMerchantReference]
-        );
-        console.log(`✅ Order ${OrderMerchantReference} paid via Pesapal.`);
-      } else if (['Failed', 'Invalid', 'Reversed'].includes(statusData.payment_status_description)) {
-        // 3. Mark as failed
-        await pool.query(
-          `UPDATE orders SET payment_status = 'failed' WHERE id = $1`,
-          [OrderMerchantReference]
-        );
-        console.log(`❌ Order ${OrderMerchantReference} failed. Status: ${statusData.payment_status_description}`);
-      }
+    if (!OrderTrackingId) {
+      return res.status(400).json({ error: 'Missing OrderTrackingId' });
     }
 
-    // 4. MUST respond to Pesapal with a 200 JSON to confirm receipt
-    res.json({
+    const status = await pesapal.getTransactionStatus(OrderTrackingId);
+    const desc = status?.payment_status_description;
+
+    if (desc === 'Completed') {
+      await pool.query(
+        `UPDATE orders
+         SET payment_status = 'paid',
+             mpesa_transaction_id = COALESCE($1, mpesa_transaction_id)
+         WHERE payment_reference = $2`,
+        [status?.confirmation_code || null, OrderTrackingId]
+      );
+      console.log(`✅ Pesapal IPN: order ${OrderMerchantReference} paid.`);
+    } else if (['Failed', 'Invalid', 'Reversed'].includes(desc)) {
+      await pool.query(
+        `UPDATE orders SET payment_status = 'failed' WHERE payment_reference = $1`,
+        [OrderTrackingId]
+      );
+      console.log(
+        `❌ Pesapal IPN: order ${OrderMerchantReference} — ${desc}`
+      );
+    } else {
+      console.log(
+        `⏳ Pesapal IPN: order ${OrderMerchantReference} — ${
+          desc || 'pending'
+        }`
+      );
+    }
+
+    res.status(200).json({
       orderNotificationType: OrderNotificationType || 'IPNCHANGE',
       orderTrackingId: OrderTrackingId,
       orderMerchantReference: OrderMerchantReference,
       status: 200,
     });
   } catch (error) {
-    console.error('Pesapal IPN error:', error);
-    // Respond with 500 if we couldn't process it, so Pesapal might retry
+    console.error('Pesapal IPN error:', error?.response?.data || error);
     res.status(500).json({ error: 'IPN processing failed' });
   }
 });

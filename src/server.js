@@ -67,6 +67,8 @@ const productRoutes   = require('./routes/product.routes');
 const agentRoutes     = require('./routes/agent.routes');
 const orderRoutes     = require('./routes/order.routes');
 const adminRoutes     = require('./routes/admin.routes');
+const paymentRoutes = require('./routes/payment.routes'); // 👈 NEW
+
 
 // Mount admin auth BEFORE /api/admin so /api/admin/auth/* takes priority
 app.use('/api/admin/auth', adminAuthRoutes);
@@ -78,6 +80,8 @@ app.use('/api/products',  productRoutes);
 app.use('/api/agents',    agentRoutes);
 app.use('/api/orders',    orderRoutes);
 app.use('/api/admin',     adminRoutes);
+app.use('/api/payments', paymentRoutes); // 👈 NEW
+
 
 // ============================================
 // Health check

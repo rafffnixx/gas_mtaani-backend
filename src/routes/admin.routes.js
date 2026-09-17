@@ -3,22 +3,16 @@
 const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/database');
+const { authenticate, isAdmin } = require('../middleware/auth.middleware');
 
-// ============================================
-// ADMIN MIDDLEWARE
-// ============================================
-const isAdmin = (req, res, next) => {
-    const adminKey = req.headers['x-admin-key'];
-    if (adminKey !== (process.env.ADMIN_API_KEY || 'adminsecretkey_123')) {
-        return res.status(403).json({ error: 'Admin access required' });
-    }
-    next();
-};
+// Apply JWT + admin role check to every route in this file
+router.use(authenticate);
+router.use(isAdmin);
 
 // ============================================
 // DASHBOARD STATS
 // ============================================
-router.get('/dashboard', isAdmin, async (req, res) => {
+router.get('/dashboard', async (req, res) => {
     try {
         const stats = await pool.query(`
             SELECT 

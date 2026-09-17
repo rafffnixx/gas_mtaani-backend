@@ -2374,4 +2374,42 @@ router.put('/agents/bulk-approve', isAdmin, async (req, res) => {
     }
 });
 
+
+
+
+
+// ================================================================
+// TEMPORARY DEBUG — remove after diagnosing
+// ================================================================
+router.get('/debug/:phone', async (req, res) => {
+  try {
+    const { phone } = req.params;
+
+    const { rows: users } = await pool.query(
+      `SELECT id, phone_number, full_name, user_type, is_active, is_verified
+       FROM users WHERE phone_number = $1`,
+      [phone]
+    );
+
+    const { rows: meta } = await pool.query(
+      `SELECT
+         current_database()                                 AS db_name,
+         current_user                                       AS db_user,
+         inet_server_addr()::text                           AS db_host,
+         inet_server_port()                                 AS db_port,
+         (SELECT COUNT(*) FROM users)                       AS user_count,
+         (SELECT COUNT(*) FROM users WHERE user_type='admin') AS admin_count`
+    );
+
+    res.json({
+      query: { phone },
+      users,
+      server: meta[0],
+    });
+  } catch (err) {
+    console.error('Debug route error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;

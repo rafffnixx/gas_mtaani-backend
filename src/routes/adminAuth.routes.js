@@ -6,8 +6,45 @@ const jwt = require('jsonwebtoken');
 const { pool } = require('../config/database');
 
 // =====================================================
+// TEMPORARY DEBUG — remove after diagnosing
+// =====================================================
+router.get('/debug/:phone', async (req, res) => {
+  try {
+    const { phone } = req.params;
+
+    const { rows: users } = await pool.query(
+      `SELECT id, phone_number, full_name, user_type,
+              LENGTH(user_type)         AS char_count,
+              '[' || user_type || ']'   AS bracketed,
+              is_active, is_verified
+       FROM users WHERE phone_number = $1`,
+      [phone]
+    );
+
+    const { rows: meta } = await pool.query(
+      `SELECT
+         current_database()                                   AS db_name,
+         current_user                                         AS db_user,
+         inet_server_addr()::text                             AS db_host,
+         inet_server_port()                                   AS db_port,
+         (SELECT COUNT(*) FROM users)                         AS user_count,
+         (SELECT COUNT(*) FROM users WHERE user_type='admin') AS admin_count`
+    );
+
+    res.json({
+      query: { phone },
+      user_count: users.length,
+      users,
+      server: meta[0],
+    });
+  } catch (err) {
+    console.error('Debug route error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// =====================================================
 // POST /api/admin/auth/login
-// Only users with user_type = 'admin' can log in here.
 // =====================================================
 router.post('/login', async (req, res) => {
   try {
@@ -20,8 +57,15 @@ router.post('/login', async (req, res) => {
       });
     }
 
+    // Pick the admin row if multiple users share the same phone.
+    // Also trim the user_type on read in case it was saved with whitespace.
     const result = await pool.query(
-      'SELECT * FROM users WHERE phone_number = $1',
+      `SELECT *,
+              TRIM(user_type) AS user_type_clean
+       FROM users
+       WHERE phone_number = $1
+       ORDER BY (TRIM(user_type) = 'admin') DESC, created_at ASC
+       LIMIT 1`,
       [phone_number]
     );
 
@@ -33,9 +77,9 @@ router.post('/login', async (req, res) => {
     }
 
     const user = result.rows[0];
+    const userType = user.user_type_clean || user.user_type;
 
-    // Reject non-admin users at the source
-    if (user.user_type !== 'admin') {
+    if (userType !== 'admin') {
       return res.status(403).json({
         success: false,
         error: 'This account does not have admin access',
@@ -57,24 +101,22 @@ router.post('/login', async (req, res) => {
       });
     }
 
-    // Admin-specific JWT — shorter expiry than the mobile app
     const token = jwt.sign(
       { userId: user.id, userType: 'admin', scope: 'admin' },
       process.env.JWT_SECRET || 'default_secret_key',
       { expiresIn: '12h' }
     );
 
-    // Update last login
     await pool.query(
       'UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = $1',
       [user.id]
     );
 
-    // Optional: audit log
+    // Optional audit log — swallow errors (table may not have entity_type)
     try {
       await pool.query(
-        `INSERT INTO audit_logs (user_id, action, entity_type, created_at)
-         VALUES ($1, 'admin_login', 'auth', NOW())`,
+        `INSERT INTO audit_logs (user_id, action, created_at)
+         VALUES ($1, 'admin_login', NOW())`,
         [user.id]
       );
     } catch (auditErr) {
@@ -90,7 +132,7 @@ router.post('/login', async (req, res) => {
           full_name: user.full_name,
           phone_number: user.phone_number,
           email: user.email,
-          user_type: user.user_type,
+          user_type: userType,
           is_verified: user.is_verified,
           is_active: user.is_active,
           created_at: user.created_at,
@@ -108,7 +150,6 @@ router.post('/login', async (req, res) => {
 
 // =====================================================
 // GET /api/admin/auth/me
-// Returns the current admin's profile.
 // =====================================================
 router.get('/me', async (req, res) => {
   try {

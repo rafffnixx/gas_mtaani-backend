@@ -28,7 +28,11 @@ router.get('/threads', async (req, res) => {
       `
       SELECT
         t.id,
+        t.support_id,
         t.type,
+        t.subject,
+        t.category,
+        t.priority,
         t.status,
         t.order_id,
         t.customer_id,
@@ -36,6 +40,7 @@ router.get('/threads', async (req, res) => {
         t.last_message_at,
         t.last_message_preview,
         t.created_at,
+        t.resolved_at,
         o.order_number,
         o.status AS order_status,
         o.assigned_partner_code,
@@ -69,10 +74,66 @@ router.get('/threads', async (req, res) => {
 });
 
 // =====================================================
+// GET /api/chat/threads/:id
+// Single thread details
+// =====================================================
+router.get('/threads/:id', async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userType = req.user.user_type;
+    const { id } = req.params;
+
+    const { rows } = await pool.query(
+      `
+      SELECT
+        t.*,
+        o.order_number,
+        o.status AS order_status,
+        o.assigned_partner_code,
+        CASE
+          WHEN t.type = 'support' THEN 'Gas Mtaani Support'
+          WHEN t.customer_id = $1 THEN 'Partner ' || COALESCE(o.assigned_partner_code, 'GMNBR-XXX')
+          ELSE 'Customer'
+        END AS display_name,
+        (
+          SELECT COUNT(*)::int FROM chat_messages m
+          WHERE m.thread_id = t.id
+            AND m.sender_id <> $1
+            AND m.read_at IS NULL
+        ) AS unread_count
+      FROM chat_threads t
+      LEFT JOIN orders o ON o.id = t.order_id
+      WHERE t.id = $2
+      `,
+      [userId, id]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Thread not found' });
+    }
+    const thread = rows[0];
+
+    const isParty =
+      thread.customer_id === userId || thread.agent_id === userId;
+    const isAdmin = userType === 'admin';
+    if (!isParty && !(isAdmin && thread.type === 'support')) {
+      return res.status(403).json({ error: 'Not your thread' });
+    }
+
+    res.json(thread);
+  } catch (err) {
+    console.error('GET /chat/threads/:id error:', err);
+    res.status(500).json({ error: 'Failed to load thread' });
+  }
+});
+
+// =====================================================
 // POST /api/chat/threads
 // Create or find a thread.
-//   {}                 → support thread for the current user
-//   { order_id: "..." } → order thread
+// Body:
+//   {}                                 → support thread (default subject)
+//   { subject, category, priority }    → support thread with details
+//   { order_id, subject?, category? }  → order thread
 // =====================================================
 router.post('/threads', async (req, res) => {
   const client = await pool.connect();
@@ -81,7 +142,12 @@ router.post('/threads', async (req, res) => {
 
     const userId = req.user.id;
     const userType = req.user.user_type;
-    const { order_id } = req.body || {};
+    const {
+      order_id,
+      subject,
+      category = 'other',
+      priority = 'normal',
+    } = req.body || {};
 
     // ---------- SUPPORT THREAD ----------
     if (!order_id) {
@@ -90,26 +156,27 @@ router.post('/threads', async (req, res) => {
         return res.status(400).json({ error: 'Admins cannot open support threads' });
       }
 
-      // Look for an existing support thread for this user
+      // Reuse the most recent open support thread if one exists
       const existing = await client.query(
         `SELECT * FROM chat_threads
-         WHERE customer_id = $1 AND type = 'support'
+         WHERE customer_id = $1 AND type = 'support' AND status <> 'closed'
+         ORDER BY created_at DESC
          LIMIT 1`,
         [userId]
       );
-
       if (existing.rows.length > 0) {
         await client.query('COMMIT');
         return res.json(existing.rows[0]);
       }
 
-      // Create a new support thread
+      const finalSubject = (subject || '').trim() || 'Support request';
+
       const { rows } = await client.query(
         `INSERT INTO chat_threads
-           (type, customer_id, status, created_at, updated_at)
-         VALUES ('support', $1, 'open', NOW(), NOW())
+           (type, customer_id, status, subject, category, priority, created_at, updated_at)
+         VALUES ('support', $1, 'open', $2, $3, $4, NOW(), NOW())
          RETURNING *`,
-        [userId]
+        [userId, finalSubject, category, priority]
       );
 
       await client.query('COMMIT');
@@ -118,7 +185,7 @@ router.post('/threads', async (req, res) => {
 
     // ---------- ORDER THREAD ----------
     const orderRes = await client.query(
-      `SELECT id, customer_id, agent_id FROM orders WHERE id = $1`,
+      `SELECT id, customer_id, agent_id, order_number FROM orders WHERE id = $1`,
       [order_id]
     );
     if (orderRes.rows.length === 0) {
@@ -132,7 +199,6 @@ router.post('/threads', async (req, res) => {
       return res.status(403).json({ error: 'Not your order' });
     }
 
-    // Check for an existing thread for this order
     const existing = await client.query(
       `SELECT * FROM chat_threads WHERE order_id = $1 LIMIT 1`,
       [order_id]
@@ -142,12 +208,21 @@ router.post('/threads', async (req, res) => {
       return res.json(existing.rows[0]);
     }
 
+    const finalSubject = (subject || '').trim() || `Order #${order.order_number}`;
+
     const { rows } = await client.query(
       `INSERT INTO chat_threads
-         (type, order_id, customer_id, agent_id, status, created_at, updated_at)
-       VALUES ('order', $1, $2, $3, 'open', NOW(), NOW())
+         (type, order_id, customer_id, agent_id, status, subject, category, priority, created_at, updated_at)
+       VALUES ('order', $1, $2, $3, 'open', $4, $5, $6, NOW(), NOW())
        RETURNING *`,
-      [order_id, order.customer_id, order.agent_id]
+      [
+        order_id,
+        order.customer_id,
+        order.agent_id,
+        finalSubject,
+        category === 'other' ? 'order' : category,
+        priority,
+      ]
     );
 
     await client.query('COMMIT');
@@ -314,6 +389,60 @@ router.post('/threads/:id/read', async (req, res) => {
   } catch (err) {
     console.error('POST /chat/read error:', err);
     res.status(500).json({ error: 'Failed to mark read' });
+  }
+});
+
+// =====================================================
+// PUT /api/chat/threads/:id/status
+// Change thread status: open | pending | resolved | closed
+// =====================================================
+router.put('/threads/:id/status', async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userType = req.user.user_type;
+    const { id } = req.params;
+    const { status } = req.body || {};
+
+    const allowed = ['open', 'pending', 'resolved', 'closed'];
+    if (!allowed.includes(status)) {
+      return res.status(400).json({
+        error: 'Invalid status',
+        allowed,
+      });
+    }
+
+    const threadRes = await pool.query(
+      `SELECT * FROM chat_threads WHERE id = $1`,
+      [id]
+    );
+    if (threadRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Thread not found' });
+    }
+    const thread = threadRes.rows[0];
+
+    const isParty =
+      thread.customer_id === userId || thread.agent_id === userId;
+    const isAdmin = userType === 'admin';
+    if (!isParty && !(isAdmin && thread.type === 'support')) {
+      return res.status(403).json({ error: 'Not your thread' });
+    }
+
+    const resolvedAt = status === 'resolved' || status === 'closed' ? 'NOW()' : 'NULL';
+
+    const { rows } = await pool.query(
+      `UPDATE chat_threads
+       SET status = $1,
+           resolved_at = ${resolvedAt},
+           updated_at = NOW()
+       WHERE id = $2
+       RETURNING *`,
+      [status, id]
+    );
+
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('PUT /chat/threads/:id/status error:', err);
+    res.status(500).json({ error: 'Failed to update status' });
   }
 });
 

@@ -78,17 +78,17 @@ app.use(
 // ============================================
 // Routes
 // ============================================
-const authRoutes      = require('./routes/auth.routes');
-const adminAuthRoutes = require('./routes/adminAuth.routes');
-const customerRoutes  = require('./routes/customer.routes');
-const productRoutes   = require('./routes/product.routes');
-const agentRoutes     = require('./routes/agent.routes');
-const orderRoutes     = require('./routes/order.routes');
-const adminRoutes     = require('./routes/admin.routes');
-const paymentRoutes   = require('./routes/payment.routes');
-const quoteRoutes     = require('./routes/quote.routes');   // 👈 NEW
-const chatRoutes = require('./routes/chat.routes');
-
+const authRoutes          = require('./routes/auth.routes');
+const adminAuthRoutes     = require('./routes/adminAuth.routes');
+const customerRoutes      = require('./routes/customer.routes');
+const productRoutes       = require('./routes/product.routes');
+const agentRoutes         = require('./routes/agent.routes');
+const orderRoutes         = require('./routes/order.routes');
+const adminRoutes         = require('./routes/admin.routes');
+const paymentRoutes       = require('./routes/payment.routes');
+const quoteRoutes         = require('./routes/quote.routes');   // 👈 NEW
+const chatRoutes          = require('./routes/chat.routes');
+const notificationsRoutes = require('./routes/notifications.routes'); // 👈 NEW
 
 // Mount admin auth BEFORE /api/admin so /api/admin/auth/* takes priority
 app.use('/api/admin/auth', adminAuthRoutes);
@@ -98,8 +98,8 @@ app.use('/api/auth',      authRoutes);
 app.use('/api/customers', customerRoutes);
 app.use('/api/products',  productRoutes);
 app.use('/api/agents',    agentRoutes);
-app.use('/api/chat', chatRoutes);
-
+app.use('/api/chat',      chatRoutes);
+app.use('/api/notifications', notificationsRoutes);   // 👈 NEW
 
 // ⚠️  quoteRoutes must be mounted BEFORE orderRoutes so /api/orders/quote
 //     isn't shadowed by the catch-all GET /:orderId in order.routes.js
@@ -150,4 +150,5 @@ app.listen(PORT, () => {
   console.log(`🔑 Admin routes: http://localhost:${PORT}/api/admin`);
   console.log(`🖼  Assets:      http://localhost:${PORT}/assets/*`);
   console.log(`💬 Quotes:       http://localhost:${PORT}/api/orders/quote`);
+  console.log(`🔔 Notifications: http://localhost:${PORT}/api/notifications`);
 });

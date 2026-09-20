@@ -3,13 +3,13 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/database');
 const { authenticate, isAgent } = require('../middleware/auth.middleware');
+const { latLngToHex, hexesUpToRing } = require('../utils/hexGrid');
 
 // =====================================================
-// CREATE ORDER (Customer) — consumes a pre-validated quote
-// Body: { quote_id, payment_method, delivery_address,
-//         special_instructions, customer_latitude, customer_longitude,
-//         customer_address_id, location_source, county_code,
-//         constituency_code, ward_code, area_name, landmark }
+// CREATE ORDER (Customer)
+// Creates the order in 'searching' state and kicks off the
+// background agent search. The customer is redirected to the
+// Payment screen where they wait 1-2 minutes for a partner.
 // =====================================================
 router.post('/', authenticate, async (req, res) => {
   const client = await pool.connect();
@@ -43,7 +43,7 @@ router.post('/', authenticate, async (req, res) => {
     }
 
     // --------------------------------------------------
-    // 1. Load and lock the quote
+    // Load and lock the quote
     // --------------------------------------------------
     const qr = await client.query(
       `SELECT * FROM order_quotes
@@ -77,73 +77,10 @@ router.post('/', authenticate, async (req, res) => {
     }
 
     // --------------------------------------------------
-    // 2. Re-verify agent is still online and has capacity
-    // --------------------------------------------------
-    const agentRes = await client.query(
-      `SELECT id, partner_code, is_online, current_order_count,
-              max_order_capacity
-       FROM agents WHERE id = $1`,
-      [quote.agent_id]
-    );
-    const agent = agentRes.rows[0];
-    if (!agent) {
-      await client.query('ROLLBACK');
-      return res.status(409).json({ error: 'Assigned partner no longer exists' });
-    }
-    if (!agent.is_online) {
-      await client.query('ROLLBACK');
-      return res.status(409).json({
-        error: 'Assigned partner is offline',
-        hint: 'Request a new quote',
-      });
-    }
-    if (agent.current_order_count >= agent.max_order_capacity) {
-      await client.query('ROLLBACK');
-      return res.status(409).json({
-        error: 'Assigned partner is at capacity',
-        hint: 'Request a new quote',
-      });
-    }
-
-    // --------------------------------------------------
-    // 3. Re-verify and deduct stock for every line
-    // --------------------------------------------------
-    const items = quote.items; // [{ product_id, quantity, unit_price, ... }]
-
-    for (const item of items) {
-      const inv = await client.query(
-        `SELECT id, stock_quantity FROM agent_inventory
-         WHERE agent_id = $1 AND product_id = $2
-           AND is_available = true
-         FOR UPDATE`,
-        [quote.agent_id, item.product_id]
-      );
-      if (inv.rows.length === 0 || inv.rows[0].stock_quantity < item.quantity) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({
-          error: `Insufficient stock for ${item.name}`,
-          product_id: item.product_id,
-          hint: 'Request a new quote',
-        });
-      }
-      await client.query(
-        `UPDATE agent_inventory
-         SET stock_quantity = stock_quantity - $1,
-             is_available   = CASE
-               WHEN stock_quantity - $1 <= 0 THEN false
-               ELSE is_available
-             END,
-             updated_at     = NOW()
-         WHERE id = $2`,
-        [item.quantity, inv.rows[0].id]
-      );
-    }
-
-    // --------------------------------------------------
-    // 4. Create the order — already assigned
+    // Create order in 'searching' state — no agent yet
     // --------------------------------------------------
     const orderNumber = `GM-${Date.now().toString().slice(-8)}`;
-    const firstItem = items[0];
+    const firstItem = quote.items[0];
 
     const orderRes = await client.query(
       `INSERT INTO orders (
@@ -154,28 +91,26 @@ router.post('/', authenticate, async (req, res) => {
          special_instructions, payment_method,
          customer_address_id, location_source,
          county_code, constituency_code, ward_code, area_name, landmark,
-         assigned_partner_code, extended_fee, hex_ring,
-         status, assigned_at, created_at, updated_at
+         extended_fee,
+         status, created_at, updated_at
        ) VALUES (
-         $1,$2,$3,
-         $4,$5,$6,
-         $7,$8,
-         $9,$10,$11,
+         $1,$2,NULL,
+         $3,$4,$5,
+         0,$6,
+         $7,$8,$9,
+         $10,$11,
          $12,$13,
-         $14,$15,
-         $16,$17,$18,$19,$20,
-         $21,$22,$23,
-         'assigned', NOW(), NOW(), NOW()
+         $14,$15,$16,$17,$18,
+         0,
+         'searching', NOW(), NOW()
        )
        RETURNING *`,
       [
         orderNumber,
         customerId,
-        quote.agent_id,
         firstItem.product_id,
         firstItem.quantity,
         firstItem.unit_price,
-        0, // delivery_fee is 0 — it's baked into the product price
         quote.grand_total,
         customer_latitude ?? null,
         customer_longitude ?? null,
@@ -189,17 +124,12 @@ router.post('/', authenticate, async (req, res) => {
         ward_code || null,
         area_name || null,
         landmark || null,
-        agent.partner_code,
-        quote.extended_fee || 0,
-        quote.hex_ring || null,
       ]
     );
     const order = orderRes.rows[0];
 
-    // --------------------------------------------------
-    // 5. Persist all line items
-    // --------------------------------------------------
-    for (const item of items) {
+    // Persist line items
+    for (const item of quote.items) {
       await client.query(
         `INSERT INTO order_items (order_id, product_id, quantity, unit_price)
          VALUES ($1, $2, $3, $4)`,
@@ -207,17 +137,7 @@ router.post('/', authenticate, async (req, res) => {
       );
     }
 
-    // --------------------------------------------------
-    // 6. Bump agent load, mark quote used
-    // --------------------------------------------------
-    await client.query(
-      `UPDATE agents
-       SET current_order_count = current_order_count + 1,
-           updated_at          = NOW()
-       WHERE id = $1`,
-      [quote.agent_id]
-    );
-
+    // Mark quote used
     await client.query(
       `UPDATE order_quotes SET status = 'used' WHERE id = $1`,
       [quote_id]
@@ -225,16 +145,22 @@ router.post('/', authenticate, async (req, res) => {
 
     await client.query('COMMIT');
 
-    // Customer-facing response — no agent details
-    res.status(201).json({
+    // --------------------------------------------------
+    // Fire background tasks — do NOT await
+    // --------------------------------------------------
+    runAgentSearch(order.id).catch((err) =>
+      console.error('runAgentSearch failed:', err)
+    );
+    scheduleAutoCancel(order.id, 2 * 60 * 1000); // 2 minutes
+
+    return res.status(201).json({
       success: true,
-      message: 'Order placed successfully',
+      message: 'Order placed — finding a partner',
       order: {
         id: order.id,
         order_number: order.order_number,
-        status: order.status,
+        status: order.status, // 'searching'
         total_amount: Number(order.total_amount),
-        extended_fee: Number(order.extended_fee || 0),
         payment_status: order.payment_status,
       },
     });
@@ -249,6 +175,190 @@ router.post('/', authenticate, async (req, res) => {
     client.release();
   }
 });
+
+// =====================================================
+// BACKGROUND: Find an agent for this order.
+// Walks rings 1–3 using the customer's hex. On success, updates
+// the order to 'assigned' and increments the agent's load.
+// =====================================================
+async function runAgentSearch(orderId) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, customer_latitude, customer_longitude, status
+       FROM orders WHERE id = $1`,
+      [orderId]
+    );
+    if (rows.length === 0) return;
+    const order = rows[0];
+
+    if (order.status !== 'searching') return;
+
+    if (
+      order.customer_latitude == null ||
+      order.customer_longitude == null
+    ) {
+      console.warn(`Order ${orderId} has no coords — cannot search`);
+      return;
+    }
+
+    const lat = Number(order.customer_latitude);
+    const lng = Number(order.customer_longitude);
+
+    // Items in this order
+    const itemsRes = await pool.query(
+      `SELECT product_id, quantity FROM order_items WHERE order_id = $1`,
+      [orderId]
+    );
+    const items = itemsRes.rows;
+    if (items.length === 0) return;
+
+    const productIds = items.map((i) => i.product_id);
+    const itemCount = items.length;
+
+    // Compute the customer's hex and walk rings
+    const customerHex = latLngToHex(lat, lng);
+
+    for (let ring = 1; ring <= 3; ring++) {
+      const hexes = hexesUpToRing(customerHex, ring);
+
+      const { rows: candidates } = await pool.query(
+        `
+        SELECT
+          a.id                AS agent_id,
+          a.partner_code,
+          a.rating,
+          a.current_order_count,
+          COUNT(DISTINCT ai.product_id) AS items_covered
+        FROM agents a
+        JOIN agent_inventory ai ON ai.agent_id = a.id
+        WHERE a.hex_id = ANY($1::bigint[])
+          AND a.is_online = true
+          AND a.is_approved = true
+          AND a.current_order_count < a.max_order_capacity
+          AND ai.product_id = ANY($2::uuid[])
+          AND ai.is_available = true
+          AND ai.stock_quantity > 0
+        GROUP BY a.id, a.partner_code, a.rating, a.current_order_count
+        HAVING COUNT(DISTINCT ai.product_id) = $3
+        ORDER BY a.current_order_count ASC, a.rating DESC NULLS LAST
+        LIMIT 1
+        `,
+        [hexes, productIds, itemCount]
+      );
+
+      if (candidates.length > 0) {
+        const agent = candidates[0];
+
+        // Transaction: re-check status + deduct stock + assign
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+
+          const lock = await client.query(
+            `SELECT status FROM orders WHERE id = $1 FOR UPDATE`,
+            [orderId]
+          );
+          if (lock.rows[0]?.status !== 'searching') {
+            await client.query('ROLLBACK');
+            return;
+          }
+
+          // Deduct stock for every item
+          for (const item of items) {
+            const inv = await client.query(
+              `SELECT id, stock_quantity FROM agent_inventory
+               WHERE agent_id = $1 AND product_id = $2
+                 AND is_available = true
+               FOR UPDATE`,
+              [agent.agent_id, item.product_id]
+            );
+            if (
+              inv.rows.length === 0 ||
+              inv.rows[0].stock_quantity < item.quantity
+            ) {
+              // Race condition: stock vanished. Abort this assignment.
+              await client.query('ROLLBACK');
+              throw new Error('Stock changed during assignment');
+            }
+            await client.query(
+              `UPDATE agent_inventory
+               SET stock_quantity = stock_quantity - $1,
+                   is_available = CASE
+                     WHEN stock_quantity - $1 <= 0 THEN false
+                     ELSE is_available
+                   END,
+                   updated_at = NOW()
+               WHERE id = $2`,
+              [item.quantity, inv.rows[0].id]
+            );
+          }
+
+          // Assign the order
+          await client.query(
+            `UPDATE orders
+             SET agent_id = $1,
+                 assigned_partner_code = $2,
+                 hex_ring = $3,
+                 status = 'assigned',
+                 assigned_at = NOW(),
+                 updated_at = NOW()
+             WHERE id = $4`,
+            [agent.agent_id, agent.partner_code, ring, orderId]
+          );
+
+          // Increment agent load
+          await client.query(
+            `UPDATE agents
+             SET current_order_count = current_order_count + 1,
+                 updated_at = NOW()
+             WHERE id = $1`,
+            [agent.agent_id]
+          );
+
+          await client.query('COMMIT');
+          console.log(
+            `✅ Order ${orderId} assigned to ${agent.partner_code} (ring ${ring})`
+          );
+          return;
+        } catch (err) {
+          console.error('Assignment transaction failed:', err.message);
+          // Fall through to the next ring and try another agent
+        } finally {
+          client.release();
+        }
+      }
+    }
+
+    console.log(`❌ No agent found for order ${orderId}`);
+    // scheduleAutoCancel will handle the cancellation
+  } catch (err) {
+    console.error('runAgentSearch error:', err);
+  }
+}
+
+// =====================================================
+// BACKGROUND: Auto-cancel an order if still 'searching' after N ms
+// =====================================================
+function scheduleAutoCancel(orderId, delayMs) {
+  setTimeout(async () => {
+    try {
+      const { rowCount } = await pool.query(
+        `UPDATE orders
+         SET status = 'cancelled',
+             cancellation_reason = 'no_agent_available',
+             cancelled_at = NOW(),
+             updated_at = NOW()
+         WHERE id = $1 AND status = 'searching'`,
+        [orderId]
+      );
+      if (rowCount > 0) {
+        console.log(`⏱  Order ${orderId} auto-cancelled (no agent in 2 min)`);
+      }
+    } catch (err) {
+      console.error('Auto-cancel error:', err);
+    }
+  }, delayMs);
+}
 
 // =====================================================
 // GET CUSTOMER ORDERS
@@ -301,7 +411,7 @@ router.get('/customer', authenticate, async (req, res) => {
 });
 
 // =====================================================
-// GET ORDER DETAILS (customer's own) — includes line items
+// GET ORDER DETAILS (customer's own)
 // =====================================================
 router.get('/:orderId', authenticate, async (req, res) => {
   try {
@@ -323,7 +433,6 @@ router.get('/:orderId', authenticate, async (req, res) => {
       return res.status(404).json({ error: 'Order not found' });
     }
 
-    // Fetch all line items for this order
     const itemsRes = await pool.query(
       `SELECT oi.id, oi.product_id, oi.quantity, oi.unit_price,
               p.name AS product_name, p.brand_name, p.image_url
@@ -345,8 +454,7 @@ router.get('/:orderId', authenticate, async (req, res) => {
 });
 
 // =====================================================
-// ACCEPT ORDER (Agent) — stock already deducted at order creation.
-// This handler only flips status to 'accepted'.
+// ACCEPT ORDER (Agent) — stock already deducted by background search
 // =====================================================
 router.put('/:orderId/accept', authenticate, isAgent, async (req, res) => {
   try {
@@ -374,9 +482,9 @@ router.put('/:orderId/accept', authenticate, isAgent, async (req, res) => {
 
     const updated = await pool.query(
       `UPDATE orders
-       SET status      = 'accepted',
+       SET status = 'accepted',
            accepted_at = NOW(),
-           updated_at  = NOW()
+           updated_at = NOW()
        WHERE id = $1
        RETURNING *`,
       [orderId]
@@ -389,13 +497,12 @@ router.put('/:orderId/accept', authenticate, isAgent, async (req, res) => {
     });
   } catch (error) {
     console.error('Accept order error:', error);
-    res.status(500).json({ error: 'Failed to accept order', details: error.message });
+    res.status(500).json({ error: 'Failed to accept order' });
   }
 });
 
 // =====================================================
-// DECLINE ORDER (Agent) — from New tab
-// Stock restored (it was deducted at order creation).
+// DECLINE ORDER (Agent) — restores stock
 // =====================================================
 router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
   const client = await pool.connect();
@@ -433,7 +540,7 @@ router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
       });
     }
 
-    // Restore stock since it was deducted when the order was created
+    // Restore stock
     const itemsRes = await client.query(
       `SELECT product_id, quantity FROM order_items WHERE order_id = $1`,
       [orderId]
@@ -442,8 +549,8 @@ router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
       await client.query(
         `UPDATE agent_inventory
          SET stock_quantity = stock_quantity + $1,
-             is_available   = true,
-             updated_at     = NOW()
+             is_available = true,
+             updated_at = NOW()
          WHERE agent_id = $2 AND product_id = $3`,
         [it.quantity, agentId, it.product_id]
       );
@@ -451,10 +558,10 @@ router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
 
     const result = await client.query(
       `UPDATE orders
-       SET status              = 'declined',
+       SET status = 'declined',
            cancellation_reason = $1,
-           cancelled_at        = NOW(),
-           updated_at          = NOW()
+           cancelled_at = NOW(),
+           updated_at = NOW()
        WHERE id = $2
        RETURNING *`,
       [reason.trim(), orderId]
@@ -463,7 +570,7 @@ router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
     await client.query(
       `UPDATE agents
        SET current_order_count = GREATEST(0, current_order_count - 1),
-           updated_at          = NOW()
+           updated_at = NOW()
        WHERE id = $1`,
       [agentId]
     );
@@ -480,7 +587,7 @@ router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
 });
 
 // =====================================================
-// MARK AS DELIVERED (Agent) — no stock change
+// MARK AS DELIVERED (Agent)
 // =====================================================
 router.put('/:orderId/deliver', authenticate, isAgent, async (req, res) => {
   try {
@@ -489,19 +596,25 @@ router.put('/:orderId/deliver', authenticate, isAgent, async (req, res) => {
 
     const result = await pool.query(
       `UPDATE orders
-       SET status       = 'delivered',
+       SET status = 'delivered',
            delivered_at = NOW(),
-           updated_at   = NOW()
+           updated_at = NOW()
        WHERE id = $1 AND agent_id = $2 AND status = 'accepted'
        RETURNING *`,
       [orderId, agentId]
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Order not found or cannot be delivered' });
+      return res
+        .status(404)
+        .json({ error: 'Order not found or cannot be delivered' });
     }
 
-    res.json({ success: true, message: 'Order marked as delivered', order: result.rows[0] });
+    res.json({
+      success: true,
+      message: 'Order marked as delivered',
+      order: result.rows[0],
+    });
   } catch (error) {
     console.error('Deliver order error:', error);
     res.status(500).json({ error: 'Failed to mark as delivered' });
@@ -509,97 +622,109 @@ router.put('/:orderId/deliver', authenticate, isAgent, async (req, res) => {
 });
 
 // =====================================================
-// CANCEL ORDER BY AGENT — from Active tab
-// Reason required. Stock restored for every line.
+// CANCEL ORDER BY AGENT — restores stock
 // =====================================================
-router.put('/:orderId/cancel-by-agent', authenticate, isAgent, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
+router.put(
+  '/:orderId/cancel-by-agent',
+  authenticate,
+  isAgent,
+  async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
 
-    const agentId = req.user.id;
-    const { orderId } = req.params;
-    const { reason } = req.body;
+      const agentId = req.user.id;
+      const { orderId } = req.params;
+      const { reason } = req.body;
 
-    if (!reason || !reason.trim()) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'A reason is required to cancel' });
-    }
+      if (!reason || !reason.trim()) {
+        await client.query('ROLLBACK');
+        return res
+          .status(400)
+          .json({ error: 'A reason is required to cancel' });
+      }
 
-    const orderRes = await client.query(
-      `SELECT id, product_id, quantity, status, agent_id
-       FROM orders WHERE id = $1 FOR UPDATE`,
-      [orderId]
-    );
-    if (orderRes.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Order not found' });
-    }
-    const order = orderRes.rows[0];
-
-    if (order.agent_id !== agentId) {
-      await client.query('ROLLBACK');
-      return res.status(403).json({ error: 'This order is not assigned to you' });
-    }
-    if (!['accepted', 'picked_up', 'out_for_delivery'].includes(order.status)) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({
-        error: 'Only accepted orders can be cancelled',
-        status: order.status,
-      });
-    }
-
-    // Get all line items for this order
-    const itemsRes = await client.query(
-      `SELECT product_id, quantity FROM order_items WHERE order_id = $1`,
-      [orderId]
-    );
-    let lineItems = itemsRes.rows;
-    if (lineItems.length === 0) {
-      lineItems = [{ product_id: order.product_id, quantity: order.quantity }];
-    }
-
-    // Restore stock for every line
-    for (const it of lineItems) {
-      await client.query(
-        `UPDATE agent_inventory
-         SET stock_quantity = stock_quantity + $1,
-             is_available   = true,
-             updated_at     = NOW()
-         WHERE agent_id = $2 AND product_id = $3`,
-        [it.quantity, agentId, it.product_id]
+      const orderRes = await client.query(
+        `SELECT id, product_id, quantity, status, agent_id
+         FROM orders WHERE id = $1 FOR UPDATE`,
+        [orderId]
       );
+      if (orderRes.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Order not found' });
+      }
+      const order = orderRes.rows[0];
+
+      if (order.agent_id !== agentId) {
+        await client.query('ROLLBACK');
+        return res
+          .status(403)
+          .json({ error: 'This order is not assigned to you' });
+      }
+      if (!['accepted', 'picked_up', 'out_for_delivery'].includes(order.status)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          error: 'Only accepted orders can be cancelled',
+          status: order.status,
+        });
+      }
+
+      const itemsRes = await client.query(
+        `SELECT product_id, quantity FROM order_items WHERE order_id = $1`,
+        [orderId]
+      );
+      let lineItems = itemsRes.rows;
+      if (lineItems.length === 0) {
+        lineItems = [
+          { product_id: order.product_id, quantity: order.quantity },
+        ];
+      }
+
+      for (const it of lineItems) {
+        await client.query(
+          `UPDATE agent_inventory
+           SET stock_quantity = stock_quantity + $1,
+               is_available = true,
+               updated_at = NOW()
+           WHERE agent_id = $2 AND product_id = $3`,
+          [it.quantity, agentId, it.product_id]
+        );
+      }
+
+      const result = await client.query(
+        `UPDATE orders
+         SET status = 'cancelled',
+             cancellation_reason = $1,
+             cancelled_at = NOW(),
+             updated_at = NOW()
+         WHERE id = $2
+         RETURNING *`,
+        [reason.trim(), orderId]
+      );
+
+      await client.query(
+        `UPDATE agents
+         SET current_order_count = GREATEST(0, current_order_count - 1),
+             updated_at = NOW()
+         WHERE id = $1`,
+        [agentId]
+      );
+
+      await client.query('COMMIT');
+      res.json({
+        success: true,
+        message: 'Order cancelled',
+        order: result.rows[0],
+      });
+    } catch (error) {
+      await client.query('ROLLBACK');
+      console.error('Agent cancel order error:', error);
+      res.status(500).json({ error: 'Failed to cancel order' });
+    } finally {
+      client.release();
     }
-
-    const result = await client.query(
-      `UPDATE orders
-       SET status              = 'cancelled',
-           cancellation_reason = $1,
-           cancelled_at        = NOW(),
-           updated_at          = NOW()
-       WHERE id = $2
-       RETURNING *`,
-      [reason.trim(), orderId]
-    );
-
-    await client.query(
-      `UPDATE agents
-       SET current_order_count = GREATEST(0, current_order_count - 1),
-           updated_at          = NOW()
-       WHERE id = $1`,
-      [agentId]
-    );
-
-    await client.query('COMMIT');
-    res.json({ success: true, message: 'Order cancelled', order: result.rows[0] });
-  } catch (error) {
-    await client.query('ROLLBACK');
-    console.error('Agent cancel order error:', error);
-    res.status(500).json({ error: 'Failed to cancel order' });
-  } finally {
-    client.release();
   }
-});
+);
 
 // =====================================================
 // CONFIRM DELIVERY (Customer) — 90/10 split on items,
@@ -616,12 +741,12 @@ router.put('/:orderId/confirm', authenticate, async (req, res) => {
 
     const result = await client.query(
       `UPDATE orders
-       SET status            = 'confirmed',
-           confirmed_at      = NOW(),
-           customer_rating   = $2,
+       SET status = 'confirmed',
+           confirmed_at = NOW(),
+           customer_rating = $2,
            customer_feedback = $3,
-           payment_status    = 'paid',
-           updated_at        = NOW()
+           payment_status = 'paid',
+           updated_at = NOW()
        WHERE id = $1 AND customer_id = $4 AND status = 'delivered'
        RETURNING *`,
       [orderId, rating || null, feedback || null, customerId]
@@ -629,30 +754,29 @@ router.put('/:orderId/confirm', authenticate, async (req, res) => {
 
     if (result.rows.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Order not found or cannot be confirmed' });
+      return res
+        .status(404)
+        .json({ error: 'Order not found or cannot be confirmed' });
     }
     const order = result.rows[0];
 
-    // Agent gets 90% of items_total, plus 100% of extended_fee
-    const extendedFee  = Number(order.extended_fee || 0);
-    const itemsTotal   = Number(order.total_amount) - extendedFee;
-    const commission   = itemsTotal * 0.10;
+    const extendedFee = Number(order.extended_fee || 0);
+    const itemsTotal = Number(order.total_amount) - extendedFee;
+    const commission = itemsTotal * 0.10;
     const netFromItems = itemsTotal - commission;
-    const netAmount    = netFromItems + extendedFee;
+    const netAmount = netFromItems + extendedFee;
 
-    // Update agent stats
     await client.query(
       `UPDATE agents
        SET current_order_count = GREATEST(0, current_order_count - 1),
-           total_deliveries    = total_deliveries + 1,
-           total_earnings      = total_earnings + $1,
-           available_balance   = available_balance + $1,
-           updated_at          = NOW()
+           total_deliveries = total_deliveries + 1,
+           total_earnings = total_earnings + $1,
+           available_balance = available_balance + $1,
+           updated_at = NOW()
        WHERE id = $2`,
       [netAmount, order.agent_id]
     );
 
-    // Record the earnings split
     await client.query(
       `INSERT INTO agent_earnings
          (agent_id, order_id, amount, admin_commission, net_amount, created_at)
@@ -690,7 +814,8 @@ router.put('/:orderId/confirm', authenticate, async (req, res) => {
 
 // =====================================================
 // CANCEL ORDER (Customer)
-// If the agent already accepted, restore stock for every line.
+// If the customer cancels, the background search aborts.
+// Stock restoration only matters if an agent was assigned.
 // =====================================================
 router.put('/:orderId/cancel', authenticate, async (req, res) => {
   const client = await pool.connect();
@@ -716,7 +841,9 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'Not your order' });
     }
-    if (!['pending', 'assigned', 'accepted'].includes(order.status)) {
+    if (
+      !['pending', 'searching', 'assigned', 'accepted'].includes(order.status)
+    ) {
       await client.query('ROLLBACK');
       return res.status(400).json({
         error: 'Order cannot be cancelled in its current state',
@@ -724,7 +851,7 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
       });
     }
 
-    // Restore stock if the agent hadn't accepted yet (stock was deducted at order creation)
+    // Only restore stock if an agent was assigned
     if (order.agent_id && ['assigned', 'accepted'].includes(order.status)) {
       const itemsRes = await client.query(
         `SELECT product_id, quantity FROM order_items WHERE order_id = $1`,
@@ -732,27 +859,26 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
       );
       let lineItems = itemsRes.rows;
       if (lineItems.length === 0) {
-        lineItems = [{ product_id: order.product_id, quantity: order.quantity }];
+        lineItems = [
+          { product_id: order.product_id, quantity: order.quantity },
+        ];
       }
 
       for (const it of lineItems) {
         await client.query(
           `UPDATE agent_inventory
            SET stock_quantity = stock_quantity + $1,
-               is_available   = true,
-               updated_at     = NOW()
+               is_available = true,
+               updated_at = NOW()
            WHERE agent_id = $2 AND product_id = $3`,
           [it.quantity, order.agent_id, it.product_id]
         );
       }
-    }
 
-    // Release the agent slot if assigned or accepted
-    if (order.agent_id && ['assigned', 'accepted'].includes(order.status)) {
       await client.query(
         `UPDATE agents
          SET current_order_count = GREATEST(0, current_order_count - 1),
-             updated_at          = NOW()
+             updated_at = NOW()
          WHERE id = $1`,
         [order.agent_id]
       );
@@ -760,17 +886,21 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
 
     const result = await client.query(
       `UPDATE orders
-       SET status              = 'cancelled',
-           cancelled_at        = NOW(),
+       SET status = 'cancelled',
+           cancelled_at = NOW(),
            cancellation_reason = $1,
-           updated_at          = NOW()
+           updated_at = NOW()
        WHERE id = $2
        RETURNING *`,
       [reason || 'Cancelled by customer', orderId]
     );
 
     await client.query('COMMIT');
-    res.json({ success: true, message: 'Order cancelled', order: result.rows[0] });
+    res.json({
+      success: true,
+      message: 'Order cancelled',
+      order: result.rows[0],
+    });
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Cancel order error:', error);

@@ -86,6 +86,7 @@ const agentRoutes     = require('./routes/agent.routes');
 const orderRoutes     = require('./routes/order.routes');
 const adminRoutes     = require('./routes/admin.routes');
 const paymentRoutes   = require('./routes/payment.routes');
+const quoteRoutes     = require('./routes/quote.routes');   // 👈 NEW
 
 // Mount admin auth BEFORE /api/admin so /api/admin/auth/* takes priority
 app.use('/api/admin/auth', adminAuthRoutes);
@@ -95,7 +96,12 @@ app.use('/api/auth',      authRoutes);
 app.use('/api/customers', customerRoutes);
 app.use('/api/products',  productRoutes);
 app.use('/api/agents',    agentRoutes);
+
+// ⚠️  quoteRoutes must be mounted BEFORE orderRoutes so /api/orders/quote
+//     isn't shadowed by the catch-all GET /:orderId in order.routes.js
+app.use('/api/orders',    quoteRoutes);   // 👈 NEW — handles POST /api/orders/quote
 app.use('/api/orders',    orderRoutes);
+
 app.use('/api/admin',     adminRoutes);
 app.use('/api/payments',  paymentRoutes);
 
@@ -139,4 +145,5 @@ app.listen(PORT, () => {
   console.log(`👤 Customers:    http://localhost:${PORT}/api/customers`);
   console.log(`🔑 Admin routes: http://localhost:${PORT}/api/admin`);
   console.log(`🖼  Assets:      http://localhost:${PORT}/assets/*`);
+  console.log(`💬 Quotes:       http://localhost:${PORT}/api/orders/quote`);
 });

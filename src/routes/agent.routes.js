@@ -198,13 +198,23 @@ router.put('/location', authenticate, isAgent, async (req, res) => {
            sub_county     = COALESCE($5, sub_county),
            ward           = COALESCE($6, ward),
            address_line   = COALESCE($7, address_line),
+           hex_id         = (
+             round(
+               (
+                 (ST_X(ST_SetSRID(ST_MakePoint($1, $2), 4326)::geometry) + 30) * cos(radians(30))
+                 - (ST_Y(ST_SetSRID(ST_MakePoint($1, $2), 4326)::geometry) + 5) * sin(radians(30))
+               ) / 0.01
+             )::bigint * 100000
+             + round((ST_Y(ST_SetSRID(ST_MakePoint($1, $2), 4326)::geometry) + 5) / 0.01)::bigint
+           ),
            updated_at     = NOW()
        WHERE id = $8
        RETURNING
          ST_Y(location::geometry) AS lat,
          ST_X(location::geometry) AS lng,
          service_radius,
-         county, sub_county, ward, address_line`,
+         county, sub_county, ward, address_line,
+         hex_id`,
       [lng, lat, radius, county, sub_county, ward, address_line, req.user.id]
     );
 
@@ -371,22 +381,45 @@ router.get('/earnings', authenticate, isAgent, async (req, res) => {
 // ================================================================
 
 // New / unassigned orders — pending + assigned for this agent
+// NOTE: customer_name / customer_phone are hidden from agents.
 router.get('/orders/new', authenticate, isAgent, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT o.*,
-              u.full_name AS customer_name,
-              u.phone_number AS customer_phone,
-              p.name        AS product_name,
-              p.brand_name  AS brand_name,
-              p.image_url   AS product_image
-       FROM orders o
-       LEFT JOIN users u    ON u.id = o.customer_id
-       LEFT JOIN products p ON p.id = o.product_id
-       WHERE (o.agent_id IS NULL OR o.agent_id = $1)
-         AND o.status IN ('pending', 'assigned')
-       ORDER BY o.created_at DESC
-       LIMIT 50`,
+      `
+      WITH order_items_agg AS (
+        SELECT
+          oi.order_id,
+          json_agg(
+            json_build_object(
+              'product_id',   oi.product_id,
+              'product_name', p.name,
+              'brand_name',   p.brand_name,
+              'image_url',    p.image_url,
+              'quantity',     oi.quantity,
+              'unit_price',   oi.unit_price
+            )
+            ORDER BY oi.created_at ASC
+          ) AS items
+        FROM order_items oi
+        LEFT JOIN products p ON p.id = oi.product_id
+        GROUP BY oi.order_id
+      )
+      SELECT
+        o.*,
+        COALESCE(p.name,      oia.items->0->>'product_name') AS product_name,
+        COALESCE(p.brand_name, oia.items->0->>'brand_name')  AS brand_name,
+        COALESCE(p.image_url,  oia.items->0->>'image_url')   AS product_image,
+        COALESCE(oia.items, '[]'::json)                      AS items,
+        NULL::text                                           AS customer_name,
+        NULL::text                                           AS customer_phone
+      FROM orders o
+      LEFT JOIN products p          ON p.id = o.product_id
+      LEFT JOIN order_items_agg oia ON oia.order_id = o.id
+      WHERE (o.agent_id IS NULL OR o.agent_id = $1)
+        AND o.status IN ('pending', 'assigned')
+      ORDER BY o.created_at DESC
+      LIMIT 50
+      `,
       [req.user.id]
     );
     res.json(rows);
@@ -397,20 +430,43 @@ router.get('/orders/new', authenticate, isAgent, async (req, res) => {
 });
 
 // This agent's orders (all statuses)
+// NOTE: customer_name / customer_phone are hidden from agents.
 router.get('/orders', authenticate, isAgent, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT o.*,
-              u.full_name AS customer_name,
-              u.phone_number AS customer_phone,
-              p.name        AS product_name,
-              p.brand_name  AS brand_name,
-              p.image_url   AS product_image
-       FROM orders o
-       LEFT JOIN users u    ON u.id = o.customer_id
-       LEFT JOIN products p ON p.id = o.product_id
-       WHERE o.agent_id = $1
-       ORDER BY o.created_at DESC`,
+      `
+      WITH order_items_agg AS (
+        SELECT
+          oi.order_id,
+          json_agg(
+            json_build_object(
+              'product_id',   oi.product_id,
+              'product_name', p.name,
+              'brand_name',   p.brand_name,
+              'image_url',    p.image_url,
+              'quantity',     oi.quantity,
+              'unit_price',   oi.unit_price
+            )
+            ORDER BY oi.created_at ASC
+          ) AS items
+        FROM order_items oi
+        LEFT JOIN products p ON p.id = oi.product_id
+        GROUP BY oi.order_id
+      )
+      SELECT
+        o.*,
+        COALESCE(p.name,      oia.items->0->>'product_name') AS product_name,
+        COALESCE(p.brand_name, oia.items->0->>'brand_name')  AS brand_name,
+        COALESCE(p.image_url,  oia.items->0->>'image_url')   AS product_image,
+        COALESCE(oia.items, '[]'::json)                      AS items,
+        NULL::text                                           AS customer_name,
+        NULL::text                                           AS customer_phone
+      FROM orders o
+      LEFT JOIN products p          ON p.id = o.product_id
+      LEFT JOIN order_items_agg oia ON oia.order_id = o.id
+      WHERE o.agent_id = $1
+      ORDER BY o.created_at DESC
+      `,
       [req.user.id]
     );
     res.json(rows);
@@ -591,14 +647,10 @@ router.get('/withdrawals', authenticate, isAgent, async (req, res) => {
 // REGISTRATION / DOCS
 // ================================================================
 router.post('/register', authenticate, async (req, res) => {
-  // The customer auth router usually creates the base user; this route
-  // just makes sure an agent profile exists. Adjust to your signup flow.
   res.status(501).json({ error: 'Agent self-registration not implemented yet' });
 });
 
 router.post('/upload-docs', authenticate, isAgent, async (req, res) => {
-  // File upload placeholder — wire to Cloudinary/S3 and update the
-  // relevant *_url columns on `agents`.
   res.status(501).json({ error: 'Document upload not implemented yet' });
 });
 

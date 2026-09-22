@@ -55,18 +55,30 @@ async function createNotification({
   const runner = client || pool;
 
   try {
+    // All parameters are explicitly cast so Postgres can resolve their
+    // types unambiguously — this avoids the "inconsistent types deduced
+    // for parameter $N" error when the same placeholder appears in
+    // multiple clauses.
+    //
     // Dedup: skip if the same event for the same user in the same minute exists.
     const { rows } = await runner.query(
       `
       INSERT INTO notifications
         (user_id, title, message, type, data, is_read, created_at)
-      SELECT $1, $2, $3, $4, $5::jsonb, false, NOW()
+      SELECT
+        $1::uuid,
+        $2::varchar,
+        $3::text,
+        $4::varchar,
+        $5::jsonb,
+        false,
+        NOW()
       WHERE NOT EXISTS (
         SELECT 1 FROM notifications
-        WHERE user_id = $1
-          AND type = $4
-          AND data->>'event' = $6
-          AND ($7::text IS NULL OR data->>'group_key' = $7)
+        WHERE user_id = $1::uuid
+          AND type = $4::varchar
+          AND data->>'event' = $6::text
+          AND ($7::text IS NULL OR data->>'group_key' = $7::text)
           AND created_at > NOW() - INTERVAL '1 minute'
       )
       RETURNING *
@@ -153,7 +165,7 @@ async function notifyOrderEvent(order, status, opts = {}) {
  */
 async function listNotifications(userId, { limit = 50, unreadOnly = false } = {}) {
   const params = [userId, limit];
-  let where = `WHERE user_id = $1`;
+  let where = `WHERE user_id = $1::uuid`;
   if (unreadOnly) where += ` AND is_read = false`;
 
   const { rows } = await pool.query(
@@ -162,7 +174,7 @@ async function listNotifications(userId, { limit = 50, unreadOnly = false } = {}
     FROM notifications
     ${where}
     ORDER BY created_at DESC
-    LIMIT $2
+    LIMIT $2::int
     `,
     params
   );
@@ -176,7 +188,7 @@ async function unreadCount(userId) {
   const { rows } = await pool.query(
     `SELECT COUNT(*)::int AS count
      FROM notifications
-     WHERE user_id = $1 AND is_read = false`,
+     WHERE user_id = $1::uuid AND is_read = false`,
     [userId]
   );
   return rows[0]?.count || 0;
@@ -189,7 +201,7 @@ async function markRead(userId, notificationId) {
   const { rows } = await pool.query(
     `UPDATE notifications
      SET is_read = true
-     WHERE id = $1 AND user_id = $2 AND is_read = false
+     WHERE id = $1::uuid AND user_id = $2::uuid AND is_read = false
      RETURNING *`,
     [notificationId, userId]
   );
@@ -203,7 +215,7 @@ async function markAllRead(userId) {
   await pool.query(
     `UPDATE notifications
      SET is_read = true
-     WHERE user_id = $1 AND is_read = false`,
+     WHERE user_id = $1::uuid AND is_read = false`,
     [userId]
   );
   return true;
@@ -218,8 +230,8 @@ async function markGroupRead(userId, groupKey) {
   await pool.query(
     `UPDATE notifications
      SET is_read = true
-     WHERE user_id = $1
-       AND data->>'group_key' = $2
+     WHERE user_id = $1::uuid
+       AND data->>'group_key' = $2::text
        AND is_read = false`,
     [userId, groupKey]
   );

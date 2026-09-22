@@ -104,8 +104,8 @@ async function createNotificationForMany({ userIds, ...rest }) {
  * Fire the correct notification(s) for an order event.
  * Called from every route that changes order status.
  *
- * `order.agent_id` refers to agents.id, but notifications.user_id
- * expects users.id. This helper resolves the mapping before inserting.
+ * In this schema, `agents.id` IS `users.id` (FK: agents_id_fkey → users.id),
+ * so `order.agent_id` is directly usable as `notifications.user_id`.
  *
  * @param {object} order   full order row (id, order_number, customer_id, agent_id)
  * @param {string} status  new status
@@ -115,7 +115,6 @@ async function notifyOrderEvent(order, status, opts = {}) {
   if (!order || !order.id) return;
 
   const { client = null } = opts;
-  const runner = client || pool;
 
   const ctx = {
     order_number: order.order_number,
@@ -136,35 +135,16 @@ async function notifyOrderEvent(order, status, opts = {}) {
   }
 
   // ---- Agent ----
-  // order.agent_id is agents.id — resolve to users.id first.
+  // agents.id === users.id, so use order.agent_id directly. No lookup needed.
   if (order.agent_id) {
-    try {
-      const { rows } = await runner.query(
-        `SELECT user_id FROM agents WHERE id = $1`,
-        [order.agent_id]
-      );
-      const agentUserId = rows[0]?.user_id;
-
-      if (agentUserId) {
-        await createNotification({
-          userId: agentUserId,
-          eventType: 'order_status',
-          templateKey: 'order_status_agent',
-          groupKey: `order:${order.id}`,
-          ctx,
-          client,
-        });
-      } else {
-        console.warn(
-          `notifyOrderEvent: no users.id for agents.id=${order.agent_id}`
-        );
-      }
-    } catch (e) {
-      console.error(
-        `notifyOrderEvent: agent lookup failed for agents.id=${order.agent_id}:`,
-        e.message
-      );
-    }
+    await createNotification({
+      userId: order.agent_id,
+      eventType: 'order_status',
+      templateKey: 'order_status_agent',
+      groupKey: `order:${order.id}`,
+      ctx,
+      client,
+    });
   }
 }
 

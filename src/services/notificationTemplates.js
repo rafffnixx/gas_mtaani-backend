@@ -16,7 +16,7 @@ const templates = {
         accepted:          'Your partner accepted the order.',
         picked_up:         'Your order has been picked up.',
         out_for_delivery:  'Your order is on the way.',
-        delivered:         'Delivered! Please confirm.',
+        delivered:         'Delivered! Please confirm to complete.',
         confirmed:         'Order confirmed. Thank you!',
         cancelled:         'Order cancelled.',
         declined:          'The partner declined. Finding another…',
@@ -33,10 +33,14 @@ const templates = {
     title: (c) => `Order #${c.order_number}`,
     body: (c) => {
       const map = {
-        assigned:  'New order assigned to you. Tap to accept.',
-        accepted:  'You accepted this order.',
-        picked_up: 'You picked up the order.',
-        delivered: 'You marked the order delivered.',
+        assigned:         'New order assigned to you. Tap to accept.',
+        accepted:         'You accepted this order. Head to the pickup.',
+        picked_up:        'You picked up the order.',
+        out_for_delivery: 'You are out for delivery.',
+        delivered:        'You marked the order delivered.',
+        confirmed:        'Customer confirmed. Earnings added.',
+        cancelled:        'Order cancelled by customer.',
+        declined:         'You declined this order.',
       };
       return map[c.status] || 'Order updated.';
     },

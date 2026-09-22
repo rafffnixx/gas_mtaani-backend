@@ -1,15 +1,13 @@
-// 📁 backend/routes/order.routes.js
+// 📁 backend/src/routes/order.routes.js
 const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/database');
 const { authenticate, isAgent } = require('../middleware/auth.middleware');
 const { latLngToHex, hexesUpToRing } = require('../utils/hexGrid');
+const { notifyOrderEvent } = require('../services/notificationService');
 
 // =====================================================
 // CREATE ORDER (Customer)
-// Creates the order in 'searching' state and kicks off the
-// background agent search. The customer is redirected to the
-// Payment screen where they wait 1-2 minutes for a partner.
 // =====================================================
 router.post('/', authenticate, async (req, res) => {
   const client = await pool.connect();
@@ -42,9 +40,6 @@ router.post('/', authenticate, async (req, res) => {
       return res.status(400).json({ error: 'delivery_address is required' });
     }
 
-    // --------------------------------------------------
-    // Load and lock the quote
-    // --------------------------------------------------
     const qr = await client.query(
       `SELECT * FROM order_quotes
        WHERE id = $1 AND customer_id = $2
@@ -76,9 +71,6 @@ router.post('/', authenticate, async (req, res) => {
       });
     }
 
-    // --------------------------------------------------
-    // Create order in 'searching' state — no agent yet
-    // --------------------------------------------------
     const orderNumber = `GM-${Date.now().toString().slice(-8)}`;
     const firstItem = quote.items[0];
 
@@ -128,7 +120,6 @@ router.post('/', authenticate, async (req, res) => {
     );
     const order = orderRes.rows[0];
 
-    // Persist line items
     for (const item of quote.items) {
       await client.query(
         `INSERT INTO order_items (order_id, product_id, quantity, unit_price)
@@ -137,7 +128,6 @@ router.post('/', authenticate, async (req, res) => {
       );
     }
 
-    // Mark quote used
     await client.query(
       `UPDATE order_quotes SET status = 'used' WHERE id = $1`,
       [quote_id]
@@ -145,13 +135,14 @@ router.post('/', authenticate, async (req, res) => {
 
     await client.query('COMMIT');
 
-    // --------------------------------------------------
+    // ✅ Notify customer — order received
+    await notifyOrderEvent(order, 'pending');
+
     // Fire background tasks — do NOT await
-    // --------------------------------------------------
     runAgentSearch(order.id).catch((err) =>
       console.error('runAgentSearch failed:', err)
     );
-    scheduleAutoCancel(order.id, 2 * 60 * 1000); // 2 minutes
+    scheduleAutoCancel(order.id, 2 * 60 * 1000);
 
     return res.status(201).json({
       success: true,
@@ -159,7 +150,7 @@ router.post('/', authenticate, async (req, res) => {
       order: {
         id: order.id,
         order_number: order.order_number,
-        status: order.status, // 'searching'
+        status: order.status,
         total_amount: Number(order.total_amount),
         payment_status: order.payment_status,
       },
@@ -178,8 +169,6 @@ router.post('/', authenticate, async (req, res) => {
 
 // =====================================================
 // BACKGROUND: Find an agent for this order.
-// Walks rings 1–3 using the customer's hex. On success, updates
-// the order to 'assigned' and increments the agent's load.
 // =====================================================
 async function runAgentSearch(orderId) {
   try {
@@ -204,7 +193,6 @@ async function runAgentSearch(orderId) {
     const lat = Number(order.customer_latitude);
     const lng = Number(order.customer_longitude);
 
-    // Items in this order
     const itemsRes = await pool.query(
       `SELECT product_id, quantity FROM order_items WHERE order_id = $1`,
       [orderId]
@@ -215,7 +203,6 @@ async function runAgentSearch(orderId) {
     const productIds = items.map((i) => i.product_id);
     const itemCount = items.length;
 
-    // Compute the customer's hex and walk rings
     const customerHex = latLngToHex(lat, lng);
 
     for (let ring = 1; ring <= 3; ring++) {
@@ -249,7 +236,6 @@ async function runAgentSearch(orderId) {
       if (candidates.length > 0) {
         const agent = candidates[0];
 
-        // Transaction: re-check status + deduct stock + assign
         const client = await pool.connect();
         try {
           await client.query('BEGIN');
@@ -263,7 +249,6 @@ async function runAgentSearch(orderId) {
             return;
           }
 
-          // Deduct stock for every item
           for (const item of items) {
             const inv = await client.query(
               `SELECT id, stock_quantity FROM agent_inventory
@@ -276,7 +261,6 @@ async function runAgentSearch(orderId) {
               inv.rows.length === 0 ||
               inv.rows[0].stock_quantity < item.quantity
             ) {
-              // Race condition: stock vanished. Abort this assignment.
               await client.query('ROLLBACK');
               throw new Error('Stock changed during assignment');
             }
@@ -293,8 +277,7 @@ async function runAgentSearch(orderId) {
             );
           }
 
-          // Assign the order
-          await client.query(
+          const assignedRes = await client.query(
             `UPDATE orders
              SET agent_id = $1,
                  assigned_partner_code = $2,
@@ -302,11 +285,11 @@ async function runAgentSearch(orderId) {
                  status = 'assigned',
                  assigned_at = NOW(),
                  updated_at = NOW()
-             WHERE id = $4`,
+             WHERE id = $4
+             RETURNING *`,
             [agent.agent_id, agent.partner_code, ring, orderId]
           );
 
-          // Increment agent load
           await client.query(
             `UPDATE agents
              SET current_order_count = current_order_count + 1,
@@ -316,13 +299,16 @@ async function runAgentSearch(orderId) {
           );
 
           await client.query('COMMIT');
+
+          // ✅ Notify customer + assigned agent
+          await notifyOrderEvent(assignedRes.rows[0], 'assigned');
+
           console.log(
             `✅ Order ${orderId} assigned to ${agent.partner_code} (ring ${ring})`
           );
           return;
         } catch (err) {
           console.error('Assignment transaction failed:', err.message);
-          // Fall through to the next ring and try another agent
         } finally {
           client.release();
         }
@@ -330,7 +316,6 @@ async function runAgentSearch(orderId) {
     }
 
     console.log(`❌ No agent found for order ${orderId}`);
-    // scheduleAutoCancel will handle the cancellation
   } catch (err) {
     console.error('runAgentSearch error:', err);
   }
@@ -342,17 +327,20 @@ async function runAgentSearch(orderId) {
 function scheduleAutoCancel(orderId, delayMs) {
   setTimeout(async () => {
     try {
-      const { rowCount } = await pool.query(
+      const { rows, rowCount } = await pool.query(
         `UPDATE orders
          SET status = 'cancelled',
              cancellation_reason = 'no_agent_available',
              cancelled_at = NOW(),
              updated_at = NOW()
-         WHERE id = $1 AND status = 'searching'`,
+         WHERE id = $1 AND status = 'searching'
+         RETURNING *`,
         [orderId]
       );
       if (rowCount > 0) {
         console.log(`⏱  Order ${orderId} auto-cancelled (no agent in 2 min)`);
+        // ✅ Notify customer — no partner found
+        await notifyOrderEvent(rows[0], 'cancelled');
       }
     } catch (err) {
       console.error('Auto-cancel error:', err);
@@ -379,7 +367,6 @@ router.get('/customer', authenticate, async (req, res) => {
       [customerId]
     );
 
-    // Attach items[] to each order
     const orderIds = result.rows.map((r) => r.id);
     let itemsByOrder = {};
     if (orderIds.length > 0) {
@@ -454,7 +441,7 @@ router.get('/:orderId', authenticate, async (req, res) => {
 });
 
 // =====================================================
-// ACCEPT ORDER (Agent) — stock already deducted by background search
+// ACCEPT ORDER (Agent)
 // =====================================================
 router.put('/:orderId/accept', authenticate, isAgent, async (req, res) => {
   try {
@@ -489,6 +476,9 @@ router.put('/:orderId/accept', authenticate, isAgent, async (req, res) => {
        RETURNING *`,
       [orderId]
     );
+
+    // ✅ Notify customer + agent
+    await notifyOrderEvent(updated.rows[0], 'accepted');
 
     res.json({
       success: true,
@@ -540,7 +530,6 @@ router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
       });
     }
 
-    // Restore stock
     const itemsRes = await client.query(
       `SELECT product_id, quantity FROM order_items WHERE order_id = $1`,
       [orderId]
@@ -576,6 +565,10 @@ router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
     );
 
     await client.query('COMMIT');
+
+    // ✅ Notify customer + agent
+    await notifyOrderEvent(result.rows[0], 'declined');
+
     res.json({ success: true, message: 'Order declined', order: result.rows[0] });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -588,6 +581,7 @@ router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
 
 // =====================================================
 // MARK AS DELIVERED (Agent)
+// Accept → delivered → customer confirms. No pickup step.
 // =====================================================
 router.put('/:orderId/deliver', authenticate, isAgent, async (req, res) => {
   try {
@@ -609,6 +603,9 @@ router.put('/:orderId/deliver', authenticate, isAgent, async (req, res) => {
         .status(404)
         .json({ error: 'Order not found or cannot be delivered' });
     }
+
+    // ✅ Notify customer + agent
+    await notifyOrderEvent(result.rows[0], 'delivered');
 
     res.json({
       success: true,
@@ -661,7 +658,7 @@ router.put(
           .status(403)
           .json({ error: 'This order is not assigned to you' });
       }
-      if (!['accepted', 'picked_up', 'out_for_delivery'].includes(order.status)) {
+      if (!['accepted'].includes(order.status)) {
         await client.query('ROLLBACK');
         return res.status(400).json({
           error: 'Only accepted orders can be cancelled',
@@ -711,6 +708,10 @@ router.put(
       );
 
       await client.query('COMMIT');
+
+      // ✅ Notify customer + agent
+      await notifyOrderEvent(result.rows[0], 'cancelled');
+
       res.json({
         success: true,
         message: 'Order cancelled',
@@ -791,6 +792,10 @@ router.put('/:orderId/confirm', authenticate, async (req, res) => {
     );
 
     await client.query('COMMIT');
+
+    // ✅ Notify customer + agent
+    await notifyOrderEvent(order, 'confirmed');
+
     res.json({
       success: true,
       message: 'Order confirmed successfully',
@@ -814,8 +819,6 @@ router.put('/:orderId/confirm', authenticate, async (req, res) => {
 
 // =====================================================
 // CANCEL ORDER (Customer)
-// If the customer cancels, the background search aborts.
-// Stock restoration only matters if an agent was assigned.
 // =====================================================
 router.put('/:orderId/cancel', authenticate, async (req, res) => {
   const client = await pool.connect();
@@ -851,7 +854,6 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
       });
     }
 
-    // Only restore stock if an agent was assigned
     if (order.agent_id && ['assigned', 'accepted'].includes(order.status)) {
       const itemsRes = await client.query(
         `SELECT product_id, quantity FROM order_items WHERE order_id = $1`,
@@ -896,6 +898,10 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
     );
 
     await client.query('COMMIT');
+
+    // ✅ Notify customer + agent
+    await notifyOrderEvent(result.rows[0], 'cancelled');
+
     res.json({
       success: true,
       message: 'Order cancelled',

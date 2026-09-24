@@ -8,6 +8,11 @@ const { notifyOrderEvent } = require('../services/notificationService');
 
 // =====================================================
 // CREATE ORDER (Customer)
+//
+// payment_method accepts three values:
+//   'pesapal'   → customer chose "Pay Now" at checkout
+//   'delivery'  → customer chose "Pay on Delivery" (decide method later)
+//   'cash'      → legacy; treat as 'delivery' with cash pre-selected
 // =====================================================
 router.post('/', authenticate, async (req, res) => {
   const client = await pool.connect();
@@ -39,6 +44,12 @@ router.post('/', authenticate, async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'delivery_address is required' });
     }
+
+    // Validate payment_method
+    const allowedMethods = ['pesapal', 'delivery', 'cash'];
+    const chosenMethod = allowedMethods.includes(payment_method)
+      ? payment_method
+      : 'delivery'; // safe default — customer can decide at delivery
 
     const qr = await client.query(
       `SELECT * FROM order_quotes
@@ -74,6 +85,9 @@ router.post('/', authenticate, async (req, res) => {
     const orderNumber = `GM-${Date.now().toString().slice(-8)}`;
     const firstItem = quote.items[0];
 
+    // Payment status starts 'pending' for all methods now.
+    // 'pesapal' orders get paid via the app right after creation.
+    // 'delivery' orders wait until customer confirms receipt.
     const orderRes = await client.query(
       `INSERT INTO orders (
          order_number, customer_id, agent_id,
@@ -84,7 +98,7 @@ router.post('/', authenticate, async (req, res) => {
          customer_address_id, location_source,
          county_code, constituency_code, ward_code, area_name, landmark,
          extended_fee,
-         status, created_at, updated_at
+         status, payment_status, created_at, updated_at
        ) VALUES (
          $1,$2,NULL,
          $3,$4,$5,
@@ -94,7 +108,7 @@ router.post('/', authenticate, async (req, res) => {
          $12,$13,
          $14,$15,$16,$17,$18,
          0,
-         'searching', NOW(), NOW()
+         'searching', 'pending', NOW(), NOW()
        )
        RETURNING *`,
       [
@@ -108,7 +122,7 @@ router.post('/', authenticate, async (req, res) => {
         customer_longitude ?? null,
         delivery_address,
         special_instructions || null,
-        payment_method || 'pesapal',
+        chosenMethod,
         customer_address_id || null,
         location_source || null,
         county_code || null,
@@ -135,10 +149,8 @@ router.post('/', authenticate, async (req, res) => {
 
     await client.query('COMMIT');
 
-    // ✅ Notify customer — order received
     await notifyOrderEvent(order, 'pending');
 
-    // Fire background tasks — do NOT await
     runAgentSearch(order.id).catch((err) =>
       console.error('runAgentSearch failed:', err)
     );
@@ -153,6 +165,7 @@ router.post('/', authenticate, async (req, res) => {
         status: order.status,
         total_amount: Number(order.total_amount),
         payment_status: order.payment_status,
+        payment_method: order.payment_method,
       },
     });
   } catch (error) {
@@ -182,10 +195,7 @@ async function runAgentSearch(orderId) {
 
     if (order.status !== 'searching') return;
 
-    if (
-      order.customer_latitude == null ||
-      order.customer_longitude == null
-    ) {
+    if (order.customer_latitude == null || order.customer_longitude == null) {
       console.warn(`Order ${orderId} has no coords — cannot search`);
       return;
     }
@@ -205,7 +215,7 @@ async function runAgentSearch(orderId) {
 
     const customerHex = latLngToHex(lat, lng);
 
-    for (let ring = 1; ring <= 3; ring++) {
+    for (let ring = 1; ring <= 4; ring++) {
       const hexes = hexesUpToRing(customerHex, ring);
 
       const { rows: candidates } = await pool.query(
@@ -223,7 +233,6 @@ async function runAgentSearch(orderId) {
           AND a.is_approved = true
           AND a.current_order_count < a.max_order_capacity
           AND ai.product_id = ANY($2::uuid[])
-          AND ai.is_available = true
           AND ai.stock_quantity > 0
         GROUP BY a.id, a.partner_code, a.rating, a.current_order_count
         HAVING COUNT(DISTINCT ai.product_id) = $3
@@ -253,7 +262,6 @@ async function runAgentSearch(orderId) {
             const inv = await client.query(
               `SELECT id, stock_quantity FROM agent_inventory
                WHERE agent_id = $1 AND product_id = $2
-                 AND is_available = true
                FOR UPDATE`,
               [agent.agent_id, item.product_id]
             );
@@ -300,7 +308,6 @@ async function runAgentSearch(orderId) {
 
           await client.query('COMMIT');
 
-          // ✅ Notify customer + assigned agent
           await notifyOrderEvent(assignedRes.rows[0], 'assigned');
 
           console.log(
@@ -339,7 +346,6 @@ function scheduleAutoCancel(orderId, delayMs) {
       );
       if (rowCount > 0) {
         console.log(`⏱  Order ${orderId} auto-cancelled (no agent in 2 min)`);
-        // ✅ Notify customer — no partner found
         await notifyOrderEvent(rows[0], 'cancelled');
       }
     } catch (err) {
@@ -442,6 +448,7 @@ router.get('/:orderId', authenticate, async (req, res) => {
 
 // =====================================================
 // ACCEPT ORDER (Agent)
+// assigned → accepted
 // =====================================================
 router.put('/:orderId/accept', authenticate, isAgent, async (req, res) => {
   try {
@@ -477,7 +484,6 @@ router.put('/:orderId/accept', authenticate, isAgent, async (req, res) => {
       [orderId]
     );
 
-    // ✅ Notify customer + agent
     await notifyOrderEvent(updated.rows[0], 'accepted');
 
     res.json({
@@ -492,7 +498,524 @@ router.put('/:orderId/accept', authenticate, isAgent, async (req, res) => {
 });
 
 // =====================================================
-// DECLINE ORDER (Agent) — restores stock
+// OUT FOR DELIVERY (Agent)
+// accepted → out_for_delivery
+// =====================================================
+router.put(
+  '/:orderId/out-for-delivery',
+  authenticate,
+  isAgent,
+  async (req, res) => {
+    try {
+      const agentId = req.user.id;
+      const { orderId } = req.params;
+
+      const result = await pool.query(
+        `UPDATE orders
+         SET status = 'out_for_delivery',
+             out_for_delivery_at = NOW(),
+             updated_at = NOW()
+         WHERE id = $1 AND agent_id = $2 AND status = 'accepted'
+         RETURNING *`,
+        [orderId, agentId]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          error: 'Order not found or cannot be marked out for delivery',
+        });
+      }
+
+      await notifyOrderEvent(result.rows[0], 'out_for_delivery');
+
+      res.json({
+        success: true,
+        message: 'Order is out for delivery',
+        order: result.rows[0],
+      });
+    } catch (error) {
+      console.error('Out for delivery error:', error);
+      res.status(500).json({ error: 'Failed to mark out for delivery' });
+    }
+  }
+);
+
+// =====================================================
+// MARK AS DELIVERED (Agent)
+// out_for_delivery → delivered
+// =====================================================
+router.put('/:orderId/deliver', authenticate, isAgent, async (req, res) => {
+  try {
+    const agentId = req.user.id;
+    const { orderId } = req.params;
+
+    const result = await pool.query(
+      `UPDATE orders
+       SET status = 'delivered',
+           delivered_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $1 AND agent_id = $2 AND status = 'out_for_delivery'
+       RETURNING *`,
+      [orderId, agentId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        error: 'Order not found or cannot be delivered',
+      });
+    }
+
+    await notifyOrderEvent(result.rows[0], 'delivered');
+
+    res.json({
+      success: true,
+      message: 'Order marked as delivered',
+      order: result.rows[0],
+    });
+  } catch (error) {
+    console.error('Deliver order error:', error);
+    res.status(500).json({ error: 'Failed to mark as delivered' });
+  }
+});
+
+// =====================================================
+// CONFIRM RECEIPT (Customer)
+// delivered → confirmed
+// Payment is handled separately (via collect-cash, payment-confirmed,
+// or choose-payment-method → then one of the two).
+// =====================================================
+router.put('/:orderId/confirm', authenticate, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const customerId = req.user.id;
+    const { orderId } = req.params;
+    const { rating, feedback } = req.body;
+
+    const result = await client.query(
+      `UPDATE orders
+       SET status = 'confirmed',
+           confirmed_at = NOW(),
+           customer_rating = $2,
+           customer_feedback = $3,
+           updated_at = NOW()
+       WHERE id = $1 AND customer_id = $4 AND status = 'delivered'
+       RETURNING *`,
+      [orderId, rating || null, feedback || null, customerId]
+    );
+
+    if (result.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({
+        error: 'Order not found or cannot be confirmed',
+      });
+    }
+    const order = result.rows[0];
+
+    await client.query('COMMIT');
+
+    await notifyOrderEvent(order, 'confirmed');
+
+    res.json({
+      success: true,
+      message: 'Receipt confirmed — complete payment to close the order',
+      order,
+      payment_pending: order.payment_status !== 'paid',
+      payment_method: order.payment_method,
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Confirm order error:', error);
+    res.status(500).json({ error: 'Failed to confirm delivery' });
+  } finally {
+    client.release();
+  }
+});
+
+// =====================================================
+// CHOOSE PAYMENT METHOD (Customer)
+// confirmed + payment_method='delivery' → set to 'cash' or 'pesapal'
+//
+// This is Stage 2 of the two-stage flow. Called from PaymentScreen
+// when the customer taps "Pay Cash" or "Pay with M-PESA" on the chooser.
+//
+// After this call, the order's payment_method reflects the final decision,
+// and the customer can proceed with the corresponding action:
+//   - cash      → PUT /collect-cash will close the order
+//   - pesapal   → POST /payments/pesapal/initiate + PUT /payment-confirmed
+// =====================================================
+router.put(
+  '/:orderId/choose-payment-method',
+  authenticate,
+  async (req, res) => {
+    try {
+      const customerId = req.user.id;
+      const { orderId } = req.params;
+      const { method } = req.body || {};
+
+      if (!['cash', 'pesapal'].includes(method)) {
+        return res.status(400).json({
+          error: 'method must be "cash" or "pesapal"',
+        });
+      }
+
+      const result = await pool.query(
+        `UPDATE orders
+         SET payment_method = $1,
+             updated_at = NOW()
+         WHERE id = $2
+           AND customer_id = $3
+           AND status = 'confirmed'
+           AND payment_status <> 'paid'
+           AND payment_method = 'delivery'
+         RETURNING *`,
+        [method, orderId, customerId]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(400).json({
+          error: 'Cannot choose a payment method for this order in its current state',
+        });
+      }
+
+      res.json({
+        success: true,
+        message: `Payment method set to ${method}`,
+        order: result.rows[0],
+      });
+    } catch (error) {
+      console.error('Choose payment method error:', error);
+      res.status(500).json({ error: 'Failed to set payment method' });
+    }
+  }
+);
+
+// =====================================================
+// PAY CASH (Customer)
+// confirmed + payment_method='cash' → signals intent to pay cash
+// =====================================================
+router.put('/:orderId/pay-cash', authenticate, async (req, res) => {
+  try {
+    const customerId = req.user.id;
+    const { orderId } = req.params;
+
+    const result = await pool.query(
+      `UPDATE orders
+       SET customer_pay_cash_intent_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $1
+         AND customer_id = $2
+         AND status = 'confirmed'
+         AND payment_method = 'cash'
+         AND payment_status <> 'paid'
+       RETURNING *`,
+      [orderId, customerId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(400).json({
+        error: 'Cannot signal cash payment for this order',
+      });
+    }
+
+    // Notify the agent that the customer is ready to pay cash
+    try {
+      const { createNotification } = require('../services/notificationService');
+      await createNotification({
+        userId: result.rows[0].agent_id,
+        eventType: 'payment_pending',
+        templateKey: 'cash_ready',
+        groupKey: `order:${orderId}`,
+        ctx: {
+          order_number: result.rows[0].order_number,
+          order_id: orderId,
+          amount: result.rows[0].total_amount,
+        },
+      });
+    } catch (e) {
+      console.warn('cash_ready notify failed:', e.message);
+    }
+
+    res.json({
+      success: true,
+      message: "Agent notified — pay them in cash when they arrive.",
+      order: result.rows[0],
+    });
+  } catch (error) {
+    console.error('Pay cash error:', error);
+    res.status(500).json({ error: 'Failed to signal cash payment' });
+  }
+});
+
+// =====================================================
+// PAY ONLINE (Customer)
+// confirmed + payment_method='pesapal' → returns order id for Pesapal initiate
+// =====================================================
+router.post('/:orderId/pay-online', authenticate, async (req, res) => {
+  try {
+    const customerId = req.user.id;
+    const { orderId } = req.params;
+
+    const result = await pool.query(
+      `SELECT id, status, payment_method, payment_status, order_number, total_amount
+       FROM orders
+       WHERE id = $1 AND customer_id = $2`,
+      [orderId, customerId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    const order = result.rows[0];
+
+    if (order.payment_method !== 'pesapal') {
+      return res.status(400).json({
+        error: 'This is not a Pesapal order',
+      });
+    }
+    if (order.status !== 'confirmed') {
+      return res.status(400).json({
+        error: 'Confirm receipt before paying',
+        status: order.status,
+      });
+    }
+    if (order.payment_status === 'paid') {
+      return res.status(400).json({ error: 'Already paid' });
+    }
+
+    // The app will call /payments/pesapal/initiate separately.
+    res.json({
+      success: true,
+      order_id: order.id,
+      order_number: order.order_number,
+      amount: Number(order.total_amount),
+      message: 'Ready for payment — call initiate endpoint',
+    });
+  } catch (error) {
+    console.error('Pay online error:', error);
+    res.status(500).json({ error: 'Failed to start online payment' });
+  }
+});
+
+// =====================================================
+// COLLECT CASH (Agent)
+// confirmed + payment_method='cash' → paid + closed
+// =====================================================
+router.put('/:orderId/collect-cash', authenticate, isAgent, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const agentId = req.user.id;
+    const { orderId } = req.params;
+
+    const orderRes = await client.query(
+      `SELECT * FROM orders WHERE id = $1 AND agent_id = $2 FOR UPDATE`,
+      [orderId, agentId]
+    );
+    if (orderRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    const order = orderRes.rows[0];
+
+    if (order.payment_method !== 'cash') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: 'This order is not a cash order',
+      });
+    }
+    if (order.status !== 'confirmed') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: 'Cash can only be collected after the customer confirms receipt',
+        status: order.status,
+      });
+    }
+    if (order.payment_status === 'paid') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Cash already collected' });
+    }
+
+    const updated = await client.query(
+      `UPDATE orders
+       SET payment_status = 'paid',
+           payment_collected_at = NOW(),
+           status = 'closed',
+           closed_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $1
+       RETURNING *`,
+      [orderId]
+    );
+    const closedOrder = updated.rows[0];
+
+    // Credit the agent — 90/10 split on items, extended fee 100% to agent
+    const extendedFee = Number(closedOrder.extended_fee || 0);
+    const itemsTotal = Number(closedOrder.total_amount) - extendedFee;
+    const commission = itemsTotal * 0.10;
+    const netFromItems = itemsTotal - commission;
+    const netAmount = netFromItems + extendedFee;
+
+    await client.query(
+      `UPDATE agents
+       SET current_order_count = GREATEST(0, current_order_count - 1),
+           total_deliveries = total_deliveries + 1,
+           total_earnings = total_earnings + $1,
+           available_balance = available_balance + $1,
+           updated_at = NOW()
+       WHERE id = $2`,
+      [netAmount, agentId]
+    );
+
+    await client.query(
+      `INSERT INTO agent_earnings
+         (agent_id, order_id, amount, admin_commission, net_amount, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())`,
+      [
+        agentId,
+        orderId,
+        closedOrder.total_amount,
+        commission - extendedFee,
+        netAmount,
+      ]
+    );
+
+    await client.query('COMMIT');
+
+    await notifyOrderEvent(closedOrder, 'cash_collected');
+
+    res.json({
+      success: true,
+      message: 'Cash collected — order closed',
+      order: closedOrder,
+      credited: netAmount,
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Collect cash error:', error);
+    res.status(500).json({ error: 'Failed to collect cash' });
+  } finally {
+    client.release();
+  }
+});
+
+// =====================================================
+// PAYMENT CONFIRMED (Agent)
+// confirmed + payment_method='pesapal' → paid + closed
+// =====================================================
+router.put(
+  '/:orderId/payment-confirmed',
+  authenticate,
+  isAgent,
+  async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const agentId = req.user.id;
+      const { orderId } = req.params;
+
+      const orderRes = await client.query(
+        `SELECT * FROM orders WHERE id = $1 AND agent_id = $2 FOR UPDATE`,
+        [orderId, agentId]
+      );
+      if (orderRes.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Order not found' });
+      }
+      const order = orderRes.rows[0];
+
+      if (order.payment_method === 'cash') {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          error: 'This is a cash order — use collect-cash instead',
+        });
+      }
+      if (order.payment_method === 'delivery') {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          error: 'Customer has not chosen a payment method yet',
+        });
+      }
+      if (order.status !== 'confirmed') {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          error: 'Payment can only be confirmed after the customer confirms receipt',
+          status: order.status,
+        });
+      }
+      if (order.payment_status === 'paid') {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Payment already confirmed' });
+      }
+
+      const updated = await client.query(
+        `UPDATE orders
+         SET payment_status = 'paid',
+             payment_confirmed_by_agent_at = NOW(),
+             status = 'closed',
+             closed_at = NOW(),
+             updated_at = NOW()
+         WHERE id = $1
+         RETURNING *`,
+        [orderId]
+      );
+      const closedOrder = updated.rows[0];
+
+      const extendedFee = Number(closedOrder.extended_fee || 0);
+      const itemsTotal = Number(closedOrder.total_amount) - extendedFee;
+      const commission = itemsTotal * 0.10;
+      const netFromItems = itemsTotal - commission;
+      const netAmount = netFromItems + extendedFee;
+
+      await client.query(
+        `UPDATE agents
+         SET current_order_count = GREATEST(0, current_order_count - 1),
+             total_deliveries = total_deliveries + 1,
+             total_earnings = total_earnings + $1,
+             available_balance = available_balance + $1,
+             updated_at = NOW()
+         WHERE id = $2`,
+        [netAmount, agentId]
+      );
+
+      await client.query(
+        `INSERT INTO agent_earnings
+           (agent_id, order_id, amount, admin_commission, net_amount, created_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())`,
+        [
+          agentId,
+          orderId,
+          closedOrder.total_amount,
+          commission - extendedFee,
+          netAmount,
+        ]
+      );
+
+      await client.query('COMMIT');
+
+      await notifyOrderEvent(closedOrder, 'paid');
+
+      res.json({
+        success: true,
+        message: 'Payment confirmed — order closed',
+        order: closedOrder,
+        credited: netAmount,
+      });
+    } catch (error) {
+      await client.query('ROLLBACK');
+      console.error('Payment confirmed error:', error);
+      res.status(500).json({ error: 'Failed to confirm payment' });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// =====================================================
+// DECLINE ORDER (Agent)
 // =====================================================
 router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
   const client = await pool.connect();
@@ -566,7 +1089,6 @@ router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
 
     await client.query('COMMIT');
 
-    // ✅ Notify customer + agent
     await notifyOrderEvent(result.rows[0], 'declined');
 
     res.json({ success: true, message: 'Order declined', order: result.rows[0] });
@@ -576,45 +1098,6 @@ router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
     res.status(500).json({ error: 'Failed to decline order' });
   } finally {
     client.release();
-  }
-});
-
-// =====================================================
-// MARK AS DELIVERED (Agent)
-// Accept → delivered → customer confirms. No pickup step.
-// =====================================================
-router.put('/:orderId/deliver', authenticate, isAgent, async (req, res) => {
-  try {
-    const agentId = req.user.id;
-    const { orderId } = req.params;
-
-    const result = await pool.query(
-      `UPDATE orders
-       SET status = 'delivered',
-           delivered_at = NOW(),
-           updated_at = NOW()
-       WHERE id = $1 AND agent_id = $2 AND status = 'accepted'
-       RETURNING *`,
-      [orderId, agentId]
-    );
-
-    if (result.rows.length === 0) {
-      return res
-        .status(404)
-        .json({ error: 'Order not found or cannot be delivered' });
-    }
-
-    // ✅ Notify customer + agent
-    await notifyOrderEvent(result.rows[0], 'delivered');
-
-    res.json({
-      success: true,
-      message: 'Order marked as delivered',
-      order: result.rows[0],
-    });
-  } catch (error) {
-    console.error('Deliver order error:', error);
-    res.status(500).json({ error: 'Failed to mark as delivered' });
   }
 });
 
@@ -636,9 +1119,7 @@ router.put(
 
       if (!reason || !reason.trim()) {
         await client.query('ROLLBACK');
-        return res
-          .status(400)
-          .json({ error: 'A reason is required to cancel' });
+        return res.status(400).json({ error: 'A reason is required to cancel' });
       }
 
       const orderRes = await client.query(
@@ -654,14 +1135,12 @@ router.put(
 
       if (order.agent_id !== agentId) {
         await client.query('ROLLBACK');
-        return res
-          .status(403)
-          .json({ error: 'This order is not assigned to you' });
+        return res.status(403).json({ error: 'This order is not assigned to you' });
       }
-      if (!['accepted'].includes(order.status)) {
+      if (!['accepted', 'out_for_delivery'].includes(order.status)) {
         await client.query('ROLLBACK');
         return res.status(400).json({
-          error: 'Only accepted orders can be cancelled',
+          error: 'Only accepted or out-for-delivery orders can be cancelled',
           status: order.status,
         });
       }
@@ -709,7 +1188,6 @@ router.put(
 
       await client.query('COMMIT');
 
-      // ✅ Notify customer + agent
       await notifyOrderEvent(result.rows[0], 'cancelled');
 
       res.json({
@@ -726,96 +1204,6 @@ router.put(
     }
   }
 );
-
-// =====================================================
-// CONFIRM DELIVERY (Customer) — 90/10 split on items,
-// extended fee 100% to agent
-// =====================================================
-router.put('/:orderId/confirm', authenticate, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    const customerId = req.user.id;
-    const { orderId } = req.params;
-    const { rating, feedback } = req.body;
-
-    const result = await client.query(
-      `UPDATE orders
-       SET status = 'confirmed',
-           confirmed_at = NOW(),
-           customer_rating = $2,
-           customer_feedback = $3,
-           payment_status = 'paid',
-           updated_at = NOW()
-       WHERE id = $1 AND customer_id = $4 AND status = 'delivered'
-       RETURNING *`,
-      [orderId, rating || null, feedback || null, customerId]
-    );
-
-    if (result.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res
-        .status(404)
-        .json({ error: 'Order not found or cannot be confirmed' });
-    }
-    const order = result.rows[0];
-
-    const extendedFee = Number(order.extended_fee || 0);
-    const itemsTotal = Number(order.total_amount) - extendedFee;
-    const commission = itemsTotal * 0.10;
-    const netFromItems = itemsTotal - commission;
-    const netAmount = netFromItems + extendedFee;
-
-    await client.query(
-      `UPDATE agents
-       SET current_order_count = GREATEST(0, current_order_count - 1),
-           total_deliveries = total_deliveries + 1,
-           total_earnings = total_earnings + $1,
-           available_balance = available_balance + $1,
-           updated_at = NOW()
-       WHERE id = $2`,
-      [netAmount, order.agent_id]
-    );
-
-    await client.query(
-      `INSERT INTO agent_earnings
-         (agent_id, order_id, amount, admin_commission, net_amount, created_at)
-       VALUES ($1, $2, $3, $4, $5, NOW())`,
-      [
-        order.agent_id,
-        orderId,
-        order.total_amount,
-        commission - extendedFee,
-        netAmount,
-      ]
-    );
-
-    await client.query('COMMIT');
-
-    // ✅ Notify customer + agent
-    await notifyOrderEvent(order, 'confirmed');
-
-    res.json({
-      success: true,
-      message: 'Order confirmed successfully',
-      order,
-      credited: netAmount,
-      breakdown: {
-        items_total: itemsTotal,
-        commission,
-        extended_fee: extendedFee,
-        net_amount: netAmount,
-      },
-    });
-  } catch (error) {
-    await client.query('ROLLBACK');
-    console.error('Confirm order error:', error);
-    res.status(500).json({ error: 'Failed to confirm delivery' });
-  } finally {
-    client.release();
-  }
-});
 
 // =====================================================
 // CANCEL ORDER (Customer)
@@ -899,7 +1287,6 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
 
     await client.query('COMMIT');
 
-    // ✅ Notify customer + agent
     await notifyOrderEvent(result.rows[0], 'cancelled');
 
     res.json({
@@ -917,3 +1304,4 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
 });
 
 module.exports = router;
+

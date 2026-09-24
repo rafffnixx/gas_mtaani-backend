@@ -10,16 +10,19 @@ const templates = {
     title: (c) => `Order #${c.order_number}`,
     body: (c) => {
       const map = {
-        pending:           'We received your order.',
-        searching:         'Looking for a partner near you…',
-        assigned:          'A partner has been assigned.',
-        accepted:          'Your partner accepted the order.',
-        picked_up:         'Your order has been picked up.',
-        out_for_delivery:  'Your order is on the way.',
-        delivered:         'Delivered! Please confirm to complete.',
-        confirmed:         'Order confirmed. Thank you!',
-        cancelled:         'Order cancelled.',
-        declined:          'The partner declined. Finding another…',
+        pending:            'We received your order.',
+        searching:          'Looking for a partner near you…',
+        assigned:           'A partner has been assigned.',
+        accepted:           'Your partner accepted the order.',
+        out_for_delivery:   'Your order is on the way.',
+        delivered:          'Delivered! Please confirm receipt.',
+        confirmed:          'Thank you! Complete payment to close the order.',
+        payment_pending:    'Payment pending — tap to complete your payment.',
+        cash_collected:     'Cash received. Thank you!',
+        paid:               'Payment received. Thank you!',
+        closed:             'Order complete. Tap to rate your experience.',
+        cancelled:          'Order cancelled.',
+        declined:           'The partner declined. Finding another…',
       };
       return map[c.status] || 'Order updated.';
     },
@@ -33,14 +36,17 @@ const templates = {
     title: (c) => `Order #${c.order_number}`,
     body: (c) => {
       const map = {
-        assigned:         'New order assigned to you. Tap to accept.',
-        accepted:         'You accepted this order. Head to the pickup.',
-        picked_up:        'You picked up the order.',
-        out_for_delivery: 'You are out for delivery.',
-        delivered:        'You marked the order delivered.',
-        confirmed:        'Customer confirmed. Earnings added.',
-        cancelled:        'Order cancelled by customer.',
-        declined:         'You declined this order.',
+        assigned:          'New order assigned to you. Tap to accept.',
+        accepted:          'You accepted this order. Start the delivery when ready.',
+        out_for_delivery:  "You're out for delivery.",
+        delivered:         'You marked the order delivered. Waiting for customer confirmation.',
+        confirmed:         'Customer confirmed. Collect payment to close the order.',
+        payment_pending:   'Customer confirmed — payment is still pending.',
+        cash_collected:    'Cash received. Order closed. Earnings added.',
+        paid:              'Payment confirmed. Order closed. Earnings added.',
+        closed:            'Order closed. Earnings added.',
+        cancelled:         'Order cancelled by customer.',
+        declined:          'You declined this order.',
       };
       return map[c.status] || 'Order updated.';
     },
@@ -59,6 +65,29 @@ const templates = {
       `We received KES ${Number(c.amount || 0).toLocaleString()} for order #${c.order_number}.`,
     payload: (c) => ({
       screen: 'OrderTracking',
+      params: { orderId: c.order_id },
+    }),
+  },
+
+  payment_pending: {
+    title: (c) => `Order #${c.order_number}`,
+    body: (c) =>
+      `Payment is still pending for KES ${Number(c.amount || 0).toLocaleString()}. Tap to complete.`,
+    payload: (c) => ({
+      screen: 'OrderTracking',
+      params: { orderId: c.order_id },
+    }),
+  },
+
+  // Customer tapped "I'll pay cash now" → agent is told to expect cash
+  cash_ready: {
+    title: () => 'Customer is ready to pay',
+    body: (c) =>
+      `Order #${c.order_number} — customer says they'll pay KES ${Number(
+        c.amount || 0
+      ).toLocaleString()} in cash. Collect and confirm.`,
+    payload: (c) => ({
+      screen: 'AgentOrderDetail',
       params: { orderId: c.order_id },
     }),
   },

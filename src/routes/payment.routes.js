@@ -4,6 +4,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/database');
 const { authenticate } = require('../middleware/auth.middleware');
+const { createNotification } = require('../services/notificationService');
 
 // -----------------------------------------------------------
 // Pesapal v3 — plain HTTP, no SDK
@@ -83,6 +84,75 @@ async function getPesapalTransactionStatus(orderTrackingId) {
     throw err;
   }
   return data;
+}
+
+// -----------------------------------------------------------
+// Shared helper — update payment status + fire notification
+// Called from both the callback and the IPN handler.
+// -----------------------------------------------------------
+async function applyPaymentOutcome({ trackingId, newStatus, confirmationCode, fallbackRef }) {
+  // 1. Update the order and return the row (so we know customer_id / total_amount)
+  let updatedRow = null;
+
+  if (newStatus === 'paid') {
+    const r = await pool.query(
+      `UPDATE orders
+       SET payment_status = 'paid',
+           mpesa_transaction_id = COALESCE($1, mpesa_transaction_id)
+       WHERE payment_reference = $2
+       RETURNING id, order_number, customer_id, total_amount`,
+      [confirmationCode || null, trackingId]
+    );
+    updatedRow = r.rows[0] || null;
+  } else if (newStatus === 'failed') {
+    const r = await pool.query(
+      `UPDATE orders
+       SET payment_status = 'failed'
+       WHERE payment_reference = $1
+       RETURNING id, order_number, customer_id, total_amount`,
+      [trackingId]
+    );
+    updatedRow = r.rows[0] || null;
+  }
+
+  if (!updatedRow) {
+    console.warn(
+      `applyPaymentOutcome: no order matched payment_reference=${trackingId}`
+    );
+    return null;
+  }
+
+  // 2. Fire the notification (best-effort — never throw)
+  try {
+    if (newStatus === 'paid') {
+      await createNotification({
+        userId: updatedRow.customer_id,
+        eventType: 'payment_received',
+        templateKey: 'payment_received',
+        groupKey: `order:${updatedRow.id}`,
+        ctx: {
+          order_number: updatedRow.order_number,
+          order_id: updatedRow.id,
+          amount: updatedRow.total_amount,
+        },
+      });
+    } else if (newStatus === 'failed') {
+      await createNotification({
+        userId: updatedRow.customer_id,
+        eventType: 'payment_failed',
+        templateKey: 'payment_failed',
+        groupKey: `order:${updatedRow.id}`,
+        ctx: {
+          order_number: updatedRow.order_number,
+          order_id: updatedRow.id,
+        },
+      });
+    }
+  } catch (e) {
+    console.error('applyPaymentOutcome notification failed:', e.message);
+  }
+
+  return updatedRow;
 }
 
 // =====================================================
@@ -173,18 +243,16 @@ router.get('/pesapal/callback', async (req, res) => {
         const desc = status?.payment_status_description;
 
         if (desc === 'Completed') {
-          await pool.query(
-            `UPDATE orders
-             SET payment_status = 'paid',
-                 mpesa_transaction_id = COALESCE($1, mpesa_transaction_id)
-             WHERE payment_reference = $2`,
-            [status?.confirmation_code || null, OrderTrackingId]
-          );
+          await applyPaymentOutcome({
+            trackingId: OrderTrackingId,
+            newStatus: 'paid',
+            confirmationCode: status?.confirmation_code || null,
+          });
         } else if (['Failed', 'Invalid', 'Reversed'].includes(desc)) {
-          await pool.query(
-            `UPDATE orders SET payment_status = 'failed' WHERE payment_reference = $1`,
-            [OrderTrackingId]
-          );
+          await applyPaymentOutcome({
+            trackingId: OrderTrackingId,
+            newStatus: 'failed',
+          });
         }
       } catch (verifyErr) {
         console.warn(
@@ -229,19 +297,17 @@ async function handleIPN(req, res) {
     const desc = status?.payment_status_description;
 
     if (desc === 'Completed') {
-      await pool.query(
-        `UPDATE orders
-         SET payment_status = 'paid',
-             mpesa_transaction_id = COALESCE($1, mpesa_transaction_id)
-         WHERE payment_reference = $2`,
-        [status?.confirmation_code || null, OrderTrackingId]
-      );
+      await applyPaymentOutcome({
+        trackingId: OrderTrackingId,
+        newStatus: 'paid',
+        confirmationCode: status?.confirmation_code || null,
+      });
       console.log(`✅ Pesapal IPN: order ${OrderMerchantReference} paid.`);
     } else if (['Failed', 'Invalid', 'Reversed'].includes(desc)) {
-      await pool.query(
-        `UPDATE orders SET payment_status = 'failed' WHERE payment_reference = $1`,
-        [OrderTrackingId]
-      );
+      await applyPaymentOutcome({
+        trackingId: OrderTrackingId,
+        newStatus: 'failed',
+      });
       console.log(`❌ Pesapal IPN: order ${OrderMerchantReference} — ${desc}`);
     } else {
       console.log(

@@ -3,12 +3,15 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/database');
 const { authenticate } = require('../middleware/auth.middleware');
+const {
+  createNotification,
+  markGroupRead,
+} = require('../services/notificationService');
 
 router.use(authenticate);
 
 // =====================================================
 // GET /api/chat/threads
-// List all threads for the current user
 // =====================================================
 router.get('/threads', async (req, res) => {
   try {
@@ -75,7 +78,6 @@ router.get('/threads', async (req, res) => {
 
 // =====================================================
 // GET /api/chat/threads/:id
-// Single thread details
 // =====================================================
 router.get('/threads/:id', async (req, res) => {
   try {
@@ -129,11 +131,6 @@ router.get('/threads/:id', async (req, res) => {
 
 // =====================================================
 // POST /api/chat/threads
-// Create or find a thread.
-// Body:
-//   {}                                 → support thread (default subject)
-//   { subject, category, priority }    → support thread with details
-//   { order_id, subject?, category? }  → order thread
 // =====================================================
 router.post('/threads', async (req, res) => {
   const client = await pool.connect();
@@ -156,7 +153,6 @@ router.post('/threads', async (req, res) => {
         return res.status(400).json({ error: 'Admins cannot open support threads' });
       }
 
-      // Reuse the most recent open support thread if one exists
       const existing = await client.query(
         `SELECT * FROM chat_threads
          WHERE customer_id = $1 AND type = 'support' AND status <> 'closed'
@@ -297,6 +293,7 @@ router.get('/threads/:id/messages', async (req, res) => {
 
 // =====================================================
 // POST /api/chat/threads/:id/messages
+// Insert a message AND notify the other party.
 // =====================================================
 router.post('/threads/:id/messages', async (req, res) => {
   const client = await pool.connect();
@@ -356,6 +353,45 @@ router.post('/threads/:id/messages', async (req, res) => {
     );
 
     await client.query('COMMIT');
+
+    // --------------------------------------------------
+    // Notification — who gets it, and via which template
+    // --------------------------------------------------
+    const isSupport = thread.type === 'support';
+
+    let recipientId = null;
+    let templateKey = null;
+
+    if (userType === 'customer') {
+      // Customer → agent (if assigned) or support inbox
+      recipientId = thread.agent_id || null;
+      templateKey = isSupport
+        ? 'chat_customer_reply_agent'
+        : 'chat_customer_reply_agent';
+    } else if (userType === 'agent') {
+      // Agent → customer
+      recipientId = thread.customer_id || null;
+      templateKey = isSupport ? 'chat_support_reply' : 'chat_order_reply';
+    } else if (userType === 'admin') {
+      // Admin → customer
+      recipientId = thread.customer_id || null;
+      templateKey = 'chat_support_reply';
+    }
+
+    if (recipientId) {
+      await createNotification({
+        userId: recipientId,
+        eventType: 'chat_message',
+        templateKey,
+        groupKey: `thread:${thread.id}`,
+        ctx: {
+          thread_id: thread.id,
+          order_number: thread.order_number,
+          preview: body.slice(0, 120),
+        },
+      });
+    }
+
     res.status(201).json(rows[0]);
   } catch (err) {
     await client.query('ROLLBACK');
@@ -368,12 +404,14 @@ router.post('/threads/:id/messages', async (req, res) => {
 
 // =====================================================
 // POST /api/chat/threads/:id/read
+// Marks messages as read AND clears the chat notifications.
 // =====================================================
 router.post('/threads/:id/read', async (req, res) => {
   try {
     const userId = req.user.id;
     const { id } = req.params;
 
+    // 1. Mark messages as read
     await pool.query(
       `
       UPDATE chat_messages
@@ -385,6 +423,9 @@ router.post('/threads/:id/read', async (req, res) => {
       [id, userId]
     );
 
+    // 2. Clear all notifications for this thread for this user
+    await markGroupRead(userId, `thread:${id}`);
+
     res.json({ success: true });
   } catch (err) {
     console.error('POST /chat/read error:', err);
@@ -394,7 +435,6 @@ router.post('/threads/:id/read', async (req, res) => {
 
 // =====================================================
 // PUT /api/chat/threads/:id/status
-// Change thread status: open | pending | resolved | closed
 // =====================================================
 router.put('/threads/:id/status', async (req, res) => {
   try {
@@ -427,7 +467,8 @@ router.put('/threads/:id/status', async (req, res) => {
       return res.status(403).json({ error: 'Not your thread' });
     }
 
-    const resolvedAt = status === 'resolved' || status === 'closed' ? 'NOW()' : 'NULL';
+    const resolvedAt =
+      status === 'resolved' || status === 'closed' ? 'NOW()' : 'NULL';
 
     const { rows } = await pool.query(
       `UPDATE chat_threads

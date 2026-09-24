@@ -4,6 +4,7 @@
 
 const { pool } = require('../config/database');
 const { render } = require('./notificationTemplates');
+const { sendPushToUser } = require('./pushService');
 
 // The `type` column has a CHECK constraint:
 //   type IN ('order', 'payment', 'system', 'promotion')
@@ -20,7 +21,7 @@ function typeForEvent(eventType) {
 }
 
 /**
- * Create a notification.
+ * Create a notification, then fire a push for it.
  *
  * @param {object} opts
  * @param {string} opts.userId
@@ -30,6 +31,7 @@ function typeForEvent(eventType) {
  * @param {string} [opts.groupKey]      e.g. 'order:<uuid>'
  * @param {object} [opts.payloadOverride] force a specific payload
  * @param {object} [opts.client]        optional pg client (for transactions)
+ * @param {boolean} [opts.skipPush]     set true to skip push (e.g. bulk backfill)
  */
 async function createNotification({
   userId,
@@ -39,6 +41,7 @@ async function createNotification({
   groupKey = null,
   payloadOverride = null,
   client = null,
+  skipPush = false,
 }) {
   if (!userId || !eventType || !templateKey) return null;
 
@@ -56,9 +59,7 @@ async function createNotification({
 
   try {
     // All parameters are explicitly cast so Postgres can resolve their
-    // types unambiguously — this avoids the "inconsistent types deduced
-    // for parameter $N" error when the same placeholder appears in
-    // multiple clauses.
+    // types unambiguously.
     //
     // Dedup: skip if the same event for the same user in the same minute exists.
     const { rows } = await runner.query(
@@ -93,7 +94,27 @@ async function createNotification({
         groupKey,
       ]
     );
-    return rows[0] || null;
+
+    const notification = rows[0] || null;
+
+    // If the dedup window caught a duplicate, rows[0] is undefined.
+    // In that case there's nothing to push — the notification was
+    // already sent moments ago.
+    if (notification && !skipPush) {
+      // Fire-and-forget. Any error is logged but never thrown.
+      sendPushToUser(userId, {
+        title,
+        body,
+        data: {
+          notificationId: notification.id,
+          ...data,
+        },
+      }).catch((e) =>
+        console.warn('push fan-out failed:', e?.message)
+      );
+    }
+
+    return notification;
   } catch (err) {
     // Notifications are best-effort; never crash the caller's transaction.
     console.error('createNotification failed:', err.message);

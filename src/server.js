@@ -89,6 +89,9 @@ const paymentRoutes       = require('./routes/payment.routes');
 const quoteRoutes         = require('./routes/quote.routes');   // 👈 NEW
 const chatRoutes          = require('./routes/chat.routes');
 const notificationsRoutes = require('./routes/notifications.routes'); // 👈 NEW
+const agoraRoutes = require('./routes/agora.routes');
+
+
 
 // Mount admin auth BEFORE /api/admin so /api/admin/auth/* takes priority
 app.use('/api/admin/auth', adminAuthRoutes);
@@ -100,6 +103,9 @@ app.use('/api/products',  productRoutes);
 app.use('/api/agents',    agentRoutes);
 app.use('/api/chat',      chatRoutes);
 app.use('/api/notifications', notificationsRoutes);   // 👈 NEW
+app.use('/api/agora', agoraRoutes);
+
+
 
 // ⚠️  quoteRoutes must be mounted BEFORE orderRoutes so /api/orders/quote
 //     isn't shadowed by the catch-all GET /:orderId in order.routes.js

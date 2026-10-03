@@ -7,6 +7,7 @@ const {
   generateToken,
   orderChannelName,
   supportChannelName,
+  ringOrderCounterparty,
   APP_ID,
 } = require('../services/agoraService');
 
@@ -37,7 +38,6 @@ router.post('/order-call/token', authenticate, async (req, res) => {
       return res.status(400).json({ error: 'order_id is required' });
     }
 
-    // Verify the user is either the customer or the agent on this order
     const orderRes = await pool.query(
       `SELECT id, customer_id, agent_id, order_number
        FROM orders WHERE id = $1`,
@@ -60,7 +60,6 @@ router.post('/order-call/token', authenticate, async (req, res) => {
     const uid = Math.floor(Math.random() * 1000000) + 1000;
     const token = generateToken(channelName, uid, 3600);
 
-    // Log the call session (optional, for audit)
     await pool.query(
       `INSERT INTO call_sessions (order_id, caller_id, channel_name, status)
        VALUES ($1, $2, $3, 'ringing')`,
@@ -83,6 +82,62 @@ router.post('/order-call/token', authenticate, async (req, res) => {
 });
 
 // =====================================================
+// RING THE OTHER PARTY ON AN ORDER
+// Caller hits this after getting their own token.
+// Sends a push to the counterparty with the channel details.
+// =====================================================
+router.post('/order-call/:orderId/ring', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { orderId } = req.params;
+
+    const orderRes = await pool.query(
+      `SELECT o.id, o.customer_id, o.agent_id, o.order_number,
+              cu.full_name AS customer_name, au.full_name AS agent_name
+       FROM orders o
+       LEFT JOIN users cu ON cu.id = o.customer_id
+       LEFT JOIN users au ON au.id = o.agent_id
+       WHERE o.id = $1`,
+      [orderId]
+    );
+
+    if (orderRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    const order = orderRes.rows[0];
+    const isCustomer = order.customer_id === userId;
+    const isAgent = order.agent_id === userId;
+
+    if (!isCustomer && !isAgent) {
+      return res.status(403).json({ error: 'You are not a party to this order' });
+    }
+
+    const calleeId = isCustomer ? order.agent_id : order.customer_id;
+    if (!calleeId) {
+      return res.status(400).json({ error: 'Order has no counterparty yet' });
+    }
+
+    const callerName = isCustomer ? order.customer_name : order.agent_name;
+
+    const result = await ringOrderCounterparty({
+      orderId,
+      calleeId,
+      callerName,
+    });
+
+    res.json({
+      success: true,
+      push_sent: result.sent,
+      reason: result.reason || null,
+    });
+  } catch (error) {
+    console.error('Ring order error:', error);
+    res.status(500).json({ error: 'Failed to ring counterparty' });
+  }
+});
+
+// =====================================================
 // SUPPORT CALL TOKEN
 // Customer or agent requests support. Creates a support_calls row.
 // Admin web polls for 'ringing' calls and joins the channel.
@@ -90,13 +145,12 @@ router.post('/order-call/token', authenticate, async (req, res) => {
 router.post('/support-call/token', authenticate, async (req, res) => {
   try {
     const userId = req.user.id;
-    const userType = req.user.user_type; // 'customer' | 'agent'
+    const userType = req.user.user_type;
 
     if (!['customer', 'agent'].includes(userType)) {
       return res.status(403).json({ error: 'Only customers and agents can request support calls' });
     }
 
-    // Create the support call record
     const insertRes = await pool.query(
       `INSERT INTO support_calls (caller_id, caller_type, status, channel_name)
        VALUES ($1, $2, 'ringing', 'pending')
@@ -109,7 +163,6 @@ router.post('/support-call/token', authenticate, async (req, res) => {
     const uid = Math.floor(Math.random() * 1000000) + 1000;
     const token = generateToken(channelName, uid, 3600);
 
-    // Update with the real channel name
     await pool.query(
       `UPDATE support_calls SET channel_name = $1 WHERE id = $2`,
       [channelName, callId]
@@ -132,11 +185,9 @@ router.post('/support-call/token', authenticate, async (req, res) => {
 
 // =====================================================
 // PENDING SUPPORT CALLS (Admin only)
-// Admin web polls this to see who is waiting.
 // =====================================================
 router.get('/support-calls/pending', authenticate, async (req, res) => {
   try {
-    // Only admins should call this. Add an isAdmin middleware if you have one.
     if (req.user.user_type !== 'admin') {
       return res.status(403).json({ error: 'Admin only' });
     }
@@ -160,7 +211,6 @@ router.get('/support-calls/pending', authenticate, async (req, res) => {
 
 // =====================================================
 // ANSWER SUPPORT CALL (Admin only)
-// Marks the call as answered and returns a token for the admin.
 // =====================================================
 router.post('/support-calls/:callId/answer', authenticate, async (req, res) => {
   try {
@@ -211,7 +261,6 @@ router.post('/support-calls/:callId/answer', authenticate, async (req, res) => {
 
 // =====================================================
 // END SUPPORT CALL
-// Either side can call this to mark the call ended.
 // =====================================================
 router.post('/support-calls/:callId/end', authenticate, async (req, res) => {
   try {

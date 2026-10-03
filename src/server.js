@@ -86,12 +86,12 @@ const agentRoutes         = require('./routes/agent.routes');
 const orderRoutes         = require('./routes/order.routes');
 const adminRoutes         = require('./routes/admin.routes');
 const paymentRoutes       = require('./routes/payment.routes');
-const quoteRoutes         = require('./routes/quote.routes');   // 👈 NEW
+const quoteRoutes         = require('./routes/quote.routes');
 const chatRoutes          = require('./routes/chat.routes');
-const notificationsRoutes = require('./routes/notifications.routes'); // 👈 NEW
-const agoraRoutes = require('./routes/agora.routes');
-
-
+const notificationsRoutes = require('./routes/notifications.routes');
+const agoraRoutes         = require('./routes/agora.routes');
+const businessHoursRoutes = require('./routes/businessHours.routes');
+const notificationPreferencesRoutes = require('./routes/notificationPreferences.routes');
 
 // Mount admin auth BEFORE /api/admin so /api/admin/auth/* takes priority
 app.use('/api/admin/auth', adminAuthRoutes);
@@ -100,16 +100,24 @@ app.use('/api/admin/auth', adminAuthRoutes);
 app.use('/api/auth',      authRoutes);
 app.use('/api/customers', customerRoutes);
 app.use('/api/products',  productRoutes);
-app.use('/api/agents',    agentRoutes);
 app.use('/api/chat',      chatRoutes);
-app.use('/api/notifications', notificationsRoutes);   // 👈 NEW
+app.use('/api/notifications', notificationsRoutes);
 app.use('/api/agora', agoraRoutes);
 
+// ⚠️  business-hours must be mounted BEFORE /api/agents so
+//     /api/agents/business-hours isn't shadowed by an /:id route
+//     inside agent.routes.js.
+app.use('/api/agents/business-hours', businessHoursRoutes);
 
+// Now mount the general agents router
+app.use('/api/agents',    agentRoutes);
+
+// Notification preferences — mounted on its own path, no shadowing risk
+app.use('/api/users/notification-preferences', notificationPreferencesRoutes);
 
 // ⚠️  quoteRoutes must be mounted BEFORE orderRoutes so /api/orders/quote
 //     isn't shadowed by the catch-all GET /:orderId in order.routes.js
-app.use('/api/orders',    quoteRoutes);   // 👈 NEW — handles POST /api/orders/quote
+app.use('/api/orders',    quoteRoutes);
 app.use('/api/orders',    orderRoutes);
 
 app.use('/api/admin',     adminRoutes);
@@ -157,4 +165,7 @@ app.listen(PORT, () => {
   console.log(`🖼  Assets:      http://localhost:${PORT}/assets/*`);
   console.log(`💬 Quotes:       http://localhost:${PORT}/api/orders/quote`);
   console.log(`🔔 Notifications: http://localhost:${PORT}/api/notifications`);
+  console.log(`📞 Agora:        http://localhost:${PORT}/api/agora`);
+  console.log(`🕒 Business hrs: http://localhost:${PORT}/api/agents/business-hours`);
+  console.log(`⚙️  Prefs:        http://localhost:${PORT}/api/users/notification-preferences`);
 });

@@ -346,4 +346,74 @@ router.delete('/push-token', authenticate, async (req, res) => {
   }
 });
 
+// =====================================================
+// PUT /api/auth/change-password
+// Body: { current_password, new_password }
+// Verifies the current password and updates to the new one.
+// Requires a valid JWT — uses req.user.id from the middleware.
+// =====================================================
+router.put('/change-password', authenticate, async (req, res) => {
+  try {
+    const { current_password, new_password } = req.body || {};
+
+    if (!current_password || !new_password) {
+      return res.status(400).json({
+        error: 'current_password and new_password are required',
+      });
+    }
+
+    if (typeof new_password !== 'string' || new_password.length < 6) {
+      return res.status(400).json({
+        error: 'New password must be at least 6 characters',
+      });
+    }
+
+    if (new_password.length > 128) {
+      return res.status(400).json({
+        error: 'New password is too long',
+      });
+    }
+
+    if (current_password === new_password) {
+      return res.status(400).json({
+        error: 'New password must be different from the current one',
+      });
+    }
+
+    // Load the current hash — the authenticate middleware doesn't return it
+    const userRes = await pool.query(
+      'SELECT id, password_hash FROM users WHERE id = $1',
+      [req.user.id]
+    );
+
+    if (userRes.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const { password_hash } = userRes.rows[0];
+
+    const matches = await bcrypt.compare(current_password, password_hash);
+    if (!matches) {
+      return res.status(401).json({
+        error: 'Current password is incorrect',
+      });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const newHash = await bcrypt.hash(new_password, salt);
+
+    await pool.query(
+      'UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2',
+      [newHash, req.user.id]
+    );
+
+    console.log(`🔐 Password changed for user ${req.user.id}`);
+
+    res.json({ success: true, message: 'Password updated' });
+  } catch (err) {
+    console.error('PUT /auth/change-password error:', err);
+    res.status(500).json({ error: 'Failed to change password' });
+  }
+});
+
 module.exports = router;

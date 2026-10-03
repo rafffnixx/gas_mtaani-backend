@@ -545,6 +545,77 @@ router.put('/payout-details', authenticate, isAgent, async (req, res) => {
   }
 });
 
+
+
+// =====================================================
+// GET /api/agents/reviews
+// Lists all customer ratings left on this agent's orders.
+// Customer identity is anonymized — only initials are returned.
+// =====================================================
+router.get('/reviews', authenticate, isAgent, async (req, res) => {
+  try {
+    const agentId = req.user.id;
+
+    const result = await pool.query(
+      `SELECT
+         o.id,
+         o.order_number,
+         o.customer_rating   AS rating,
+         o.customer_feedback AS feedback,
+         o.delivered_at,
+         o.confirmed_at,
+         o.updated_at,
+         u.full_name         AS customer_name
+       FROM orders o
+       LEFT JOIN users u ON u.id = o.customer_id
+       WHERE o.agent_id = $1
+         AND o.customer_rating IS NOT NULL
+       ORDER BY COALESCE(o.confirmed_at, o.delivered_at, o.updated_at) DESC
+       LIMIT 100`,
+      [agentId]
+    );
+
+    const reviews = result.rows.map((r) => {
+      let initials = 'Customer';
+      if (r.customer_name) {
+        const parts = r.customer_name.trim().split(/\s+/);
+        initials = parts
+          .map((p) => (p[0] || '').toUpperCase())
+          .filter(Boolean)
+          .join('.');
+      }
+      return {
+        id: r.id,
+        order_number: r.order_number,
+        rating: Number(r.rating),
+        feedback: r.feedback,
+        date: r.confirmed_at || r.delivered_at || r.updated_at,
+        customer_initials: initials,
+      };
+    });
+
+    const count = reviews.length;
+    const sum = reviews.reduce((s, r) => s + r.rating, 0);
+    const average = count > 0 ? sum / count : 0;
+    const distribution = [5, 4, 3, 2, 1].map((stars) => ({
+      stars,
+      count: reviews.filter((r) => r.rating === stars).length,
+    }));
+
+    res.json({
+      average: Number(average.toFixed(2)),
+      total: count,
+      distribution,
+      reviews,
+    });
+  } catch (err) {
+    console.error('GET /agents/reviews error:', err);
+    res.status(500).json({ error: 'Failed to load reviews' });
+  }
+});
+
+
+
 // ================================================================
 // WITHDRAWALS
 // ================================================================

@@ -178,6 +178,36 @@ router.post('/', authenticate, async (req, res) => {
       );
     }
 
+    // ─── Create the order's chat thread ───
+    // One thread per order, shared by customer + agent.
+    // Inserted inside the transaction so it rolls back with the order.
+    const threadRes = await client.query(
+      `INSERT INTO chat_threads
+         (type, order_id, customer_id, agent_id, status, subject,
+          category, priority, created_at, updated_at)
+       VALUES ('order', $1, $2, NULL, 'open', $3, 'order', 'normal', NOW(), NOW())
+       RETURNING id`,
+      [order.id, customerId, `Order #${orderNumber}`]
+    );
+    const threadId = threadRes.rows[0].id;
+
+    // Opening system message
+    const openingBody = `Order #${orderNumber} placed — finding a partner`;
+    await client.query(
+      `INSERT INTO chat_messages
+         (thread_id, sender_id, sender_role, body, created_at)
+       VALUES ($1, NULL, 'system', $2, NOW())`,
+      [threadId, openingBody]
+    );
+    await client.query(
+      `UPDATE chat_threads
+       SET last_message_at = NOW(),
+           last_message_preview = LEFT($1, 200)
+       WHERE id = $2`,
+      [openingBody, threadId]
+    );
+    // ────────────────────────────────────────
+
     await client.query(
       `UPDATE order_quotes SET status = 'used' WHERE id = $1`,
       [quote_id]
@@ -347,6 +377,14 @@ async function runAgentSearch(orderId) {
             [agent.agent_id, agent.partner_code, ring, orderId]
           );
 
+          // Link the thread to the agent so they see it in their list
+          await client.query(
+            `UPDATE chat_threads
+             SET agent_id = $1, updated_at = NOW()
+             WHERE order_id = $2 AND agent_id IS NULL`,
+            [agent.agent_id, orderId]
+          );
+
           await client.query(
             `UPDATE agents
              SET current_order_count = current_order_count + 1,
@@ -390,8 +428,7 @@ async function runAgentSearch(orderId) {
 }
 
 // =====================================================
-// Reassignment handler — fires when an assigned order
-// has not been accepted within REASSIGN_AFTER_MS.
+// Reassignment handler
 // =====================================================
 async function handleReassignment(orderId) {
   try {
@@ -404,7 +441,6 @@ async function handleReassignment(orderId) {
     if (rows.length === 0) return;
     const order = rows[0];
 
-    // If the agent accepted (or the order moved on) — nothing to do.
     if (order.status !== 'assigned') {
       console.log(
         `⏭  Reassignment skipped for ${order.order_number} (status=${order.status})`
@@ -412,15 +448,12 @@ async function handleReassignment(orderId) {
       return;
     }
 
-    // Add the unresponsive agent to the exclusion list
     const newExcluded = [
       ...(order.excluded_agent_ids || []),
       order.agent_id,
     ].filter(Boolean);
 
-    // Have we exhausted retries?
     if ((order.reassignment_count || 0) >= MAX_REASSIGNMENTS) {
-      // Cancel the order
       const cancelled = await pool.query(
         `UPDATE orders
          SET status = 'cancelled',
@@ -434,7 +467,6 @@ async function handleReassignment(orderId) {
         [orderId, newExcluded]
       );
 
-      // Free the unresponsive agent's slot
       await pool.query(
         `UPDATE agents
          SET current_order_count = GREATEST(0, current_order_count - 1),
@@ -454,7 +486,6 @@ async function handleReassignment(orderId) {
       return;
     }
 
-    // Reassign: reset to searching, keep the exclusion list, bump counter
     const reset = await pool.query(
       `UPDATE orders
        SET status = 'searching',
@@ -470,7 +501,14 @@ async function handleReassignment(orderId) {
       [orderId, newExcluded]
     );
 
-    // Free the unresponsive agent's slot
+    // Unlink the thread from the unresponsive agent
+    await pool.query(
+      `UPDATE chat_threads
+       SET agent_id = NULL, updated_at = NOW()
+       WHERE order_id = $1`,
+      [orderId]
+    );
+
     await pool.query(
       `UPDATE agents
        SET current_order_count = GREATEST(0, current_order_count - 1),
@@ -485,12 +523,10 @@ async function handleReassignment(orderId) {
         `🔄 Order ${order.order_number} reassigned (attempt ${(order.reassignment_count || 0) + 1}/${MAX_REASSIGNMENTS})`
       );
 
-      // Kick off a fresh search immediately
       runAgentSearch(orderId).catch((err) =>
         console.error('Reassign search failed:', err)
       );
 
-      // Restart the search timer (in case the fresh search finds nobody)
       const handle = setTimeout(() => {
         searchTimers.delete(orderId);
         handleSearchTimeout(orderId).catch((err) =>
@@ -505,8 +541,7 @@ async function handleReassignment(orderId) {
 }
 
 // =====================================================
-// Search timeout — fires when an order sits in 'searching'
-// for SEARCH_TIMEOUT_MS without finding an agent.
+// Search timeout
 // =====================================================
 async function handleSearchTimeout(orderId) {
   try {
@@ -628,7 +663,6 @@ router.get('/:orderId', authenticate, async (req, res) => {
 
 // =====================================================
 // ACCEPT ORDER (Agent)
-// assigned → accepted. Clears the reassignment timer.
 // =====================================================
 router.put('/:orderId/accept', authenticate, isAgent, async (req, res) => {
   try {
@@ -664,7 +698,6 @@ router.put('/:orderId/accept', authenticate, isAgent, async (req, res) => {
       [orderId]
     );
 
-    // ⭐ Agent accepted — cancel the reassignment timer
     clearAllTimers(orderId);
 
     await notifyOrderEvent(updated.rows[0], 'accepted');
@@ -1178,7 +1211,6 @@ router.put(
 
 // =====================================================
 // DECLINE ORDER (Agent)
-// Clears the reassignment timer. Re-triggers search immediately.
 // =====================================================
 router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
   const client = await pool.connect();
@@ -1218,7 +1250,6 @@ router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
       });
     }
 
-    // Restore stock
     const itemsRes = await client.query(
       `SELECT product_id, quantity FROM order_items WHERE order_id = $1`,
       [orderId]
@@ -1234,7 +1265,6 @@ router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
       );
     }
 
-    // Add this agent to the exclusion list and reset to searching
     const newExcluded = [
       ...(order.excluded_agent_ids || []),
       agentId,
@@ -1255,6 +1285,14 @@ router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
       [orderId, newExcluded]
     );
 
+    // Unlink thread from this agent
+    await client.query(
+      `UPDATE chat_threads
+       SET agent_id = NULL, updated_at = NOW()
+       WHERE order_id = $1`,
+      [orderId]
+    );
+
     await client.query(
       `UPDATE agents
        SET current_order_count = GREATEST(0, current_order_count - 1),
@@ -1265,17 +1303,14 @@ router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
 
     await client.query('COMMIT');
 
-    // Clear the old reassign timer (agent responded — declined)
     clearAllTimers(orderId);
 
     await notifyOrderEvent(reset.rows[0], 'searching');
 
-    // Re-trigger search for the next eligible agent
     runAgentSearch(orderId).catch((err) =>
       console.error('Post-decline search failed:', err)
     );
 
-    // Restart the search timeout
     const handle = setTimeout(() => {
       searchTimers.delete(orderId);
       handleSearchTimeout(orderId).catch((err) =>

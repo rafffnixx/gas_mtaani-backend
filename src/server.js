@@ -105,6 +105,11 @@ const businessHoursRoutes = require('./routes/businessHours.routes');
 const notificationPreferencesRoutes = require('./routes/notificationPreferences.routes');
 const agentDocumentsRoutes = require('./routes/agentDocuments.routes');
 
+// ============================================
+// Background services
+// ============================================
+const { startOrderSweeper } = require('./services/orderSweeper');
+
 // Mount admin auth BEFORE /api/admin so /api/admin/auth/* takes priority
 app.use('/api/admin/auth', adminAuthRoutes);
 
@@ -184,4 +189,7 @@ app.listen(PORT, () => {
   console.log(`🕒 Business hrs: http://localhost:${PORT}/api/agents/business-hours`);
   console.log(`📄 Docs:         http://localhost:${PORT}/api/agents/documents`);
   console.log(`⚙️  Prefs:        http://localhost:${PORT}/api/users/notification-preferences`);
+
+  // Start the background sweeper — rescues stuck orders across restarts
+  startOrderSweeper();
 });

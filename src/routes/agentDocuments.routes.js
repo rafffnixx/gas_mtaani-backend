@@ -36,7 +36,7 @@ const upload = multer({
 // GET /api/agents/documents
 // Lists the current agent's uploaded documents.
 // =====================================================
-router.get('/', authenticate, isAgent, async (req, res) => {
+router.get('/documents', authenticate, isAgent, async (req, res) => {
   try {
     const agentId = req.user.id;
     const result = await pool.query(

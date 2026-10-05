@@ -75,6 +75,17 @@ app.use(
   })
 );
 
+// Files uploaded at runtime (agent documents, etc.)
+//   → https://<host>/uploads/agent-documents/...
+app.use(
+  '/uploads',
+  express.static(path.join(__dirname, '..', 'uploads'), {
+    maxAge: '7d',
+    immutable: false,
+    fallthrough: true,
+  })
+);
+
 // ============================================
 // Routes
 // ============================================
@@ -92,6 +103,7 @@ const notificationsRoutes = require('./routes/notifications.routes');
 const agoraRoutes         = require('./routes/agora.routes');
 const businessHoursRoutes = require('./routes/businessHours.routes');
 const notificationPreferencesRoutes = require('./routes/notificationPreferences.routes');
+const agentDocumentsRoutes = require('./routes/agentDocuments.routes');
 
 // Mount admin auth BEFORE /api/admin so /api/admin/auth/* takes priority
 app.use('/api/admin/auth', adminAuthRoutes);
@@ -104,10 +116,12 @@ app.use('/api/chat',      chatRoutes);
 app.use('/api/notifications', notificationsRoutes);
 app.use('/api/agora', agoraRoutes);
 
-// ⚠️  business-hours must be mounted BEFORE /api/agents so
-//     /api/agents/business-hours isn't shadowed by an /:id route
-//     inside agent.routes.js.
+// ⚠️  business-hours and documents must be mounted BEFORE /api/agents so
+//     they aren't shadowed by an /:id route inside agent.routes.js.
+
 app.use('/api/agents/business-hours', businessHoursRoutes);
+
+app.use('/api/agents', agentDocumentsRoutes);   // ← handles GET /documents and POST /upload-docs
 
 // Now mount the general agents router
 app.use('/api/agents',    agentRoutes);
@@ -163,9 +177,11 @@ app.listen(PORT, () => {
   console.log(`👤 Customers:    http://localhost:${PORT}/api/customers`);
   console.log(`🔑 Admin routes: http://localhost:${PORT}/api/admin`);
   console.log(`🖼  Assets:      http://localhost:${PORT}/assets/*`);
+  console.log(`📤 Uploads:      http://localhost:${PORT}/uploads/*`);
   console.log(`💬 Quotes:       http://localhost:${PORT}/api/orders/quote`);
   console.log(`🔔 Notifications: http://localhost:${PORT}/api/notifications`);
   console.log(`📞 Agora:        http://localhost:${PORT}/api/agora`);
   console.log(`🕒 Business hrs: http://localhost:${PORT}/api/agents/business-hours`);
+  console.log(`📄 Docs:         http://localhost:${PORT}/api/agents/documents`);
   console.log(`⚙️  Prefs:        http://localhost:${PORT}/api/users/notification-preferences`);
 });

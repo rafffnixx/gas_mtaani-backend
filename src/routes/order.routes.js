@@ -7,12 +7,48 @@ const { latLngToHex, hexesUpToRing } = require('../utils/hexGrid');
 const { notifyOrderEvent } = require('../services/notificationService');
 
 // =====================================================
-// CREATE ORDER (Customer)
+// TIMERS — module-level so they survive across requests
 //
-// payment_method accepts three values:
-//   'pesapal'   → customer chose "Pay Now" at checkout
-//   'delivery'  → customer chose "Pay on Delivery" (decide method later)
-//   'cash'      → legacy; treat as 'delivery' with cash pre-selected
+// Every assigned order has a timer that fires after REASSIGN_AFTER_MS.
+// If the agent hasn't accepted by then, the order is reassigned to the
+// next eligible agent (with the previous one excluded).
+//
+// Every searching order has a timer that fires after SEARCH_TIMEOUT_MS.
+// If no agent has been found and accepted, the order is cancelled.
+//
+// Both timers are cleared on accept/decline/cancel/assign.
+// =====================================================
+const reassignTimers = new Map();   // orderId -> timeout handle
+const searchTimers   = new Map();   // orderId -> timeout handle
+
+// Defaults — override via env vars for testing
+const REASSIGN_AFTER_MS = Number(process.env.REASSIGN_AFTER_MS) || 3 * 60 * 1000;
+const SEARCH_TIMEOUT_MS = Number(process.env.SEARCH_TIMEOUT_MS) || 3 * 60 * 1000;
+const MAX_REASSIGNMENTS = Number(process.env.MAX_REASSIGNMENTS) || 2;
+
+function clearReassignTimer(orderId) {
+  const handle = reassignTimers.get(orderId);
+  if (handle) {
+    clearTimeout(handle);
+    reassignTimers.delete(orderId);
+  }
+}
+
+function clearSearchTimer(orderId) {
+  const handle = searchTimers.get(orderId);
+  if (handle) {
+    clearTimeout(handle);
+    searchTimers.delete(orderId);
+  }
+}
+
+function clearAllTimers(orderId) {
+  clearReassignTimer(orderId);
+  clearSearchTimer(orderId);
+}
+
+// =====================================================
+// CREATE ORDER (Customer)
 // =====================================================
 router.post('/', authenticate, async (req, res) => {
   const client = await pool.connect();
@@ -45,11 +81,10 @@ router.post('/', authenticate, async (req, res) => {
       return res.status(400).json({ error: 'delivery_address is required' });
     }
 
-    // Validate payment_method
     const allowedMethods = ['pesapal', 'delivery', 'cash'];
     const chosenMethod = allowedMethods.includes(payment_method)
       ? payment_method
-      : 'delivery'; // safe default — customer can decide at delivery
+      : 'delivery';
 
     const qr = await client.query(
       `SELECT * FROM order_quotes
@@ -85,9 +120,6 @@ router.post('/', authenticate, async (req, res) => {
     const orderNumber = `GM-${Date.now().toString().slice(-8)}`;
     const firstItem = quote.items[0];
 
-    // Payment status starts 'pending' for all methods now.
-    // 'pesapal' orders get paid via the app right after creation.
-    // 'delivery' orders wait until customer confirms receipt.
     const orderRes = await client.query(
       `INSERT INTO orders (
          order_number, customer_id, agent_id,
@@ -98,7 +130,9 @@ router.post('/', authenticate, async (req, res) => {
          customer_address_id, location_source,
          county_code, constituency_code, ward_code, area_name, landmark,
          extended_fee,
-         status, payment_status, created_at, updated_at
+         status, payment_status, reassignment_count,
+         excluded_agent_ids,
+         created_at, updated_at
        ) VALUES (
          $1,$2,NULL,
          $3,$4,$5,
@@ -108,7 +142,9 @@ router.post('/', authenticate, async (req, res) => {
          $12,$13,
          $14,$15,$16,$17,$18,
          0,
-         'searching', 'pending', NOW(), NOW()
+         'searching', 'pending', 0,
+         '{}',
+         NOW(), NOW()
        )
        RETURNING *`,
       [
@@ -151,10 +187,18 @@ router.post('/', authenticate, async (req, res) => {
 
     await notifyOrderEvent(order, 'pending');
 
+    // Kick off search, then start the search-timeout timer
     runAgentSearch(order.id).catch((err) =>
       console.error('runAgentSearch failed:', err)
     );
-    scheduleAutoCancel(order.id, 2 * 60 * 1000);
+
+    const searchHandle = setTimeout(() => {
+      searchTimers.delete(order.id);
+      handleSearchTimeout(order.id).catch((err) =>
+        console.error('handleSearchTimeout failed:', err)
+      );
+    }, SEARCH_TIMEOUT_MS);
+    searchTimers.set(order.id, searchHandle);
 
     return res.status(201).json({
       success: true,
@@ -182,11 +226,13 @@ router.post('/', authenticate, async (req, res) => {
 
 // =====================================================
 // BACKGROUND: Find an agent for this order.
+// Excludes agents in orders.excluded_agent_ids.
 // =====================================================
 async function runAgentSearch(orderId) {
   try {
     const { rows } = await pool.query(
-      `SELECT id, customer_latitude, customer_longitude, status
+      `SELECT id, customer_latitude, customer_longitude, status,
+              excluded_agent_ids, reassignment_count
        FROM orders WHERE id = $1`,
       [orderId]
     );
@@ -202,6 +248,7 @@ async function runAgentSearch(orderId) {
 
     const lat = Number(order.customer_latitude);
     const lng = Number(order.customer_longitude);
+    const excluded = order.excluded_agent_ids || [];
 
     const itemsRes = await pool.query(
       `SELECT product_id, quantity FROM order_items WHERE order_id = $1`,
@@ -234,12 +281,13 @@ async function runAgentSearch(orderId) {
           AND a.current_order_count < a.max_order_capacity
           AND ai.product_id = ANY($2::uuid[])
           AND ai.stock_quantity > 0
+          AND NOT (a.id = ANY($4::uuid[]))
         GROUP BY a.id, a.partner_code, a.rating, a.current_order_count
         HAVING COUNT(DISTINCT ai.product_id) = $3
         ORDER BY a.current_order_count ASC, a.rating DESC NULLS LAST
         LIMIT 1
         `,
-        [hexes, productIds, itemCount]
+        [hexes, productIds, itemCount, excluded]
       );
 
       if (candidates.length > 0) {
@@ -292,6 +340,7 @@ async function runAgentSearch(orderId) {
                  hex_ring = $3,
                  status = 'assigned',
                  assigned_at = NOW(),
+                 last_assigned_at = NOW(),
                  updated_at = NOW()
              WHERE id = $4
              RETURNING *`,
@@ -310,6 +359,18 @@ async function runAgentSearch(orderId) {
 
           await notifyOrderEvent(assignedRes.rows[0], 'assigned');
 
+          // Clear the search timer — we have an agent
+          clearSearchTimer(orderId);
+
+          // Start the reassignment timer — 3 min for the agent to accept
+          const handle = setTimeout(() => {
+            reassignTimers.delete(orderId);
+            handleReassignment(orderId).catch((err) =>
+              console.error('handleReassignment failed:', err)
+            );
+          }, REASSIGN_AFTER_MS);
+          reassignTimers.set(orderId, handle);
+
           console.log(
             `✅ Order ${orderId} assigned to ${agent.partner_code} (ring ${ring})`
           );
@@ -322,36 +383,155 @@ async function runAgentSearch(orderId) {
       }
     }
 
-    console.log(`❌ No agent found for order ${orderId}`);
+    console.log(`❌ No agent found for order ${orderId} on this pass`);
   } catch (err) {
     console.error('runAgentSearch error:', err);
   }
 }
 
 // =====================================================
-// BACKGROUND: Auto-cancel an order if still 'searching' after N ms
+// Reassignment handler — fires when an assigned order
+// has not been accepted within REASSIGN_AFTER_MS.
 // =====================================================
-function scheduleAutoCancel(orderId, delayMs) {
-  setTimeout(async () => {
-    try {
-      const { rows, rowCount } = await pool.query(
+async function handleReassignment(orderId) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, status, agent_id, reassignment_count,
+              excluded_agent_ids, order_number
+       FROM orders WHERE id = $1`,
+      [orderId]
+    );
+    if (rows.length === 0) return;
+    const order = rows[0];
+
+    // If the agent accepted (or the order moved on) — nothing to do.
+    if (order.status !== 'assigned') {
+      console.log(
+        `⏭  Reassignment skipped for ${order.order_number} (status=${order.status})`
+      );
+      return;
+    }
+
+    // Add the unresponsive agent to the exclusion list
+    const newExcluded = [
+      ...(order.excluded_agent_ids || []),
+      order.agent_id,
+    ].filter(Boolean);
+
+    // Have we exhausted retries?
+    if ((order.reassignment_count || 0) >= MAX_REASSIGNMENTS) {
+      // Cancel the order
+      const cancelled = await pool.query(
         `UPDATE orders
          SET status = 'cancelled',
              cancellation_reason = 'no_agent_available',
              cancelled_at = NOW(),
+             excluded_agent_ids = $2::uuid[],
+             reassignment_count = reassignment_count + 1,
              updated_at = NOW()
-         WHERE id = $1 AND status = 'searching'
+         WHERE id = $1 AND status = 'assigned'
          RETURNING *`,
-        [orderId]
+        [orderId, newExcluded]
       );
-      if (rowCount > 0) {
-        console.log(`⏱  Order ${orderId} auto-cancelled (no agent in 2 min)`);
-        await notifyOrderEvent(rows[0], 'cancelled');
+
+      // Free the unresponsive agent's slot
+      await pool.query(
+        `UPDATE agents
+         SET current_order_count = GREATEST(0, current_order_count - 1),
+             updated_at = NOW()
+         WHERE id = $1`,
+        [order.agent_id]
+      );
+
+      clearAllTimers(orderId);
+
+      if (cancelled.rows[0]) {
+        await notifyOrderEvent(cancelled.rows[0], 'cancelled');
+        console.log(
+          `⏱  Order ${order.order_number} cancelled — no agent accepted after ${MAX_REASSIGNMENTS + 1} attempts`
+        );
       }
-    } catch (err) {
-      console.error('Auto-cancel error:', err);
+      return;
     }
-  }, delayMs);
+
+    // Reassign: reset to searching, keep the exclusion list, bump counter
+    const reset = await pool.query(
+      `UPDATE orders
+       SET status = 'searching',
+           agent_id = NULL,
+           assigned_partner_code = NULL,
+           assigned_at = NULL,
+           hex_ring = NULL,
+           excluded_agent_ids = $2::uuid[],
+           reassignment_count = reassignment_count + 1,
+           updated_at = NOW()
+       WHERE id = $1 AND status = 'assigned'
+       RETURNING *`,
+      [orderId, newExcluded]
+    );
+
+    // Free the unresponsive agent's slot
+    await pool.query(
+      `UPDATE agents
+       SET current_order_count = GREATEST(0, current_order_count - 1),
+           updated_at = NOW()
+       WHERE id = $1`,
+      [order.agent_id]
+    );
+
+    if (reset.rows[0]) {
+      await notifyOrderEvent(reset.rows[0], 'searching');
+      console.log(
+        `🔄 Order ${order.order_number} reassigned (attempt ${(order.reassignment_count || 0) + 1}/${MAX_REASSIGNMENTS})`
+      );
+
+      // Kick off a fresh search immediately
+      runAgentSearch(orderId).catch((err) =>
+        console.error('Reassign search failed:', err)
+      );
+
+      // Restart the search timer (in case the fresh search finds nobody)
+      const handle = setTimeout(() => {
+        searchTimers.delete(orderId);
+        handleSearchTimeout(orderId).catch((err) =>
+          console.error('handleSearchTimeout failed:', err)
+        );
+      }, SEARCH_TIMEOUT_MS);
+      searchTimers.set(orderId, handle);
+    }
+  } catch (err) {
+    console.error('handleReassignment error:', err);
+  }
+}
+
+// =====================================================
+// Search timeout — fires when an order sits in 'searching'
+// for SEARCH_TIMEOUT_MS without finding an agent.
+// =====================================================
+async function handleSearchTimeout(orderId) {
+  try {
+    const result = await pool.query(
+      `UPDATE orders
+       SET status = 'cancelled',
+           cancellation_reason = 'no_agent_available',
+           cancelled_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $1 AND status = 'searching'
+       RETURNING *`,
+      [orderId]
+    );
+
+    clearAllTimers(orderId);
+
+    if (result.rows[0]) {
+      await notifyOrderEvent(result.rows[0], 'cancelled');
+      console.log(
+        `⏱  Order ${result.rows[0].order_number} cancelled — no agent available in radius`
+      );
+    }
+  } catch (err) {
+    console.error('handleSearchTimeout error:', err);
+  }
 }
 
 // =====================================================
@@ -448,7 +628,7 @@ router.get('/:orderId', authenticate, async (req, res) => {
 
 // =====================================================
 // ACCEPT ORDER (Agent)
-// assigned → accepted
+// assigned → accepted. Clears the reassignment timer.
 // =====================================================
 router.put('/:orderId/accept', authenticate, isAgent, async (req, res) => {
   try {
@@ -484,6 +664,9 @@ router.put('/:orderId/accept', authenticate, isAgent, async (req, res) => {
       [orderId]
     );
 
+    // ⭐ Agent accepted — cancel the reassignment timer
+    clearAllTimers(orderId);
+
     await notifyOrderEvent(updated.rows[0], 'accepted');
 
     res.json({
@@ -499,7 +682,6 @@ router.put('/:orderId/accept', authenticate, isAgent, async (req, res) => {
 
 // =====================================================
 // OUT FOR DELIVERY (Agent)
-// accepted → out_for_delivery
 // =====================================================
 router.put(
   '/:orderId/out-for-delivery',
@@ -542,7 +724,6 @@ router.put(
 
 // =====================================================
 // MARK AS DELIVERED (Agent)
-// out_for_delivery → delivered
 // =====================================================
 router.put('/:orderId/deliver', authenticate, isAgent, async (req, res) => {
   try {
@@ -580,9 +761,6 @@ router.put('/:orderId/deliver', authenticate, isAgent, async (req, res) => {
 
 // =====================================================
 // CONFIRM RECEIPT (Customer)
-// delivered → confirmed
-// Payment is handled separately (via collect-cash, payment-confirmed,
-// or choose-payment-method → then one of the two).
 // =====================================================
 router.put('/:orderId/confirm', authenticate, async (req, res) => {
   const client = await pool.connect();
@@ -635,15 +813,6 @@ router.put('/:orderId/confirm', authenticate, async (req, res) => {
 
 // =====================================================
 // CHOOSE PAYMENT METHOD (Customer)
-// confirmed + payment_method='delivery' → set to 'cash' or 'pesapal'
-//
-// This is Stage 2 of the two-stage flow. Called from PaymentScreen
-// when the customer taps "Pay Cash" or "Pay with M-PESA" on the chooser.
-//
-// After this call, the order's payment_method reflects the final decision,
-// and the customer can proceed with the corresponding action:
-//   - cash      → PUT /collect-cash will close the order
-//   - pesapal   → POST /payments/pesapal/initiate + PUT /payment-confirmed
 // =====================================================
 router.put(
   '/:orderId/choose-payment-method',
@@ -693,7 +862,6 @@ router.put(
 
 // =====================================================
 // PAY CASH (Customer)
-// confirmed + payment_method='cash' → signals intent to pay cash
 // =====================================================
 router.put('/:orderId/pay-cash', authenticate, async (req, res) => {
   try {
@@ -719,7 +887,6 @@ router.put('/:orderId/pay-cash', authenticate, async (req, res) => {
       });
     }
 
-    // Notify the agent that the customer is ready to pay cash
     try {
       const { createNotification } = require('../services/notificationService');
       await createNotification({
@@ -750,7 +917,6 @@ router.put('/:orderId/pay-cash', authenticate, async (req, res) => {
 
 // =====================================================
 // PAY ONLINE (Customer)
-// confirmed + payment_method='pesapal' → returns order id for Pesapal initiate
 // =====================================================
 router.post('/:orderId/pay-online', authenticate, async (req, res) => {
   try {
@@ -784,7 +950,6 @@ router.post('/:orderId/pay-online', authenticate, async (req, res) => {
       return res.status(400).json({ error: 'Already paid' });
     }
 
-    // The app will call /payments/pesapal/initiate separately.
     res.json({
       success: true,
       order_id: order.id,
@@ -800,7 +965,6 @@ router.post('/:orderId/pay-online', authenticate, async (req, res) => {
 
 // =====================================================
 // COLLECT CASH (Agent)
-// confirmed + payment_method='cash' → paid + closed
 // =====================================================
 router.put('/:orderId/collect-cash', authenticate, isAgent, async (req, res) => {
   const client = await pool.connect();
@@ -851,7 +1015,6 @@ router.put('/:orderId/collect-cash', authenticate, isAgent, async (req, res) => 
     );
     const closedOrder = updated.rows[0];
 
-    // Credit the agent — 90/10 split on items, extended fee 100% to agent
     const extendedFee = Number(closedOrder.extended_fee || 0);
     const itemsTotal = Number(closedOrder.total_amount) - extendedFee;
     const commission = itemsTotal * 0.10;
@@ -903,7 +1066,6 @@ router.put('/:orderId/collect-cash', authenticate, isAgent, async (req, res) => 
 
 // =====================================================
 // PAYMENT CONFIRMED (Agent)
-// confirmed + payment_method='pesapal' → paid + closed
 // =====================================================
 router.put(
   '/:orderId/payment-confirmed',
@@ -1016,6 +1178,7 @@ router.put(
 
 // =====================================================
 // DECLINE ORDER (Agent)
+// Clears the reassignment timer. Re-triggers search immediately.
 // =====================================================
 router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
   const client = await pool.connect();
@@ -1032,7 +1195,9 @@ router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
     }
 
     const orderRes = await client.query(
-      `SELECT id, status, agent_id FROM orders WHERE id = $1 FOR UPDATE`,
+      `SELECT id, status, agent_id, excluded_agent_ids, reassignment_count,
+              order_number
+       FROM orders WHERE id = $1 FOR UPDATE`,
       [orderId]
     );
     if (orderRes.rows.length === 0) {
@@ -1053,6 +1218,7 @@ router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
       });
     }
 
+    // Restore stock
     const itemsRes = await client.query(
       `SELECT product_id, quantity FROM order_items WHERE order_id = $1`,
       [orderId]
@@ -1068,15 +1234,25 @@ router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
       );
     }
 
-    const result = await client.query(
+    // Add this agent to the exclusion list and reset to searching
+    const newExcluded = [
+      ...(order.excluded_agent_ids || []),
+      agentId,
+    ].filter(Boolean);
+
+    const reset = await client.query(
       `UPDATE orders
-       SET status = 'declined',
-           cancellation_reason = $1,
-           cancelled_at = NOW(),
+       SET status = 'searching',
+           agent_id = NULL,
+           assigned_partner_code = NULL,
+           assigned_at = NULL,
+           hex_ring = NULL,
+           excluded_agent_ids = $2::uuid[],
+           reassignment_count = reassignment_count + 1,
            updated_at = NOW()
-       WHERE id = $2
+       WHERE id = $1
        RETURNING *`,
-      [reason.trim(), orderId]
+      [orderId, newExcluded]
     );
 
     await client.query(
@@ -1089,9 +1265,30 @@ router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
 
     await client.query('COMMIT');
 
-    await notifyOrderEvent(result.rows[0], 'declined');
+    // Clear the old reassign timer (agent responded — declined)
+    clearAllTimers(orderId);
 
-    res.json({ success: true, message: 'Order declined', order: result.rows[0] });
+    await notifyOrderEvent(reset.rows[0], 'searching');
+
+    // Re-trigger search for the next eligible agent
+    runAgentSearch(orderId).catch((err) =>
+      console.error('Post-decline search failed:', err)
+    );
+
+    // Restart the search timeout
+    const handle = setTimeout(() => {
+      searchTimers.delete(orderId);
+      handleSearchTimeout(orderId).catch((err) =>
+        console.error('handleSearchTimeout failed:', err)
+      );
+    }, SEARCH_TIMEOUT_MS);
+    searchTimers.set(orderId, handle);
+
+    res.json({
+      success: true,
+      message: 'Order declined — searching for another partner',
+      order: reset.rows[0],
+    });
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Decline order error:', error);
@@ -1102,7 +1299,7 @@ router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
 });
 
 // =====================================================
-// CANCEL ORDER BY AGENT — restores stock
+// CANCEL ORDER BY AGENT
 // =====================================================
 router.put(
   '/:orderId/cancel-by-agent',
@@ -1187,6 +1384,8 @@ router.put(
       );
 
       await client.query('COMMIT');
+
+      clearAllTimers(orderId);
 
       await notifyOrderEvent(result.rows[0], 'cancelled');
 
@@ -1287,6 +1486,8 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
 
     await client.query('COMMIT');
 
+    clearAllTimers(orderId);
+
     await notifyOrderEvent(result.rows[0], 'cancelled');
 
     res.json({
@@ -1304,4 +1505,3 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
 });
 
 module.exports = router;
-

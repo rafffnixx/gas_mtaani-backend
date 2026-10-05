@@ -20,6 +20,67 @@ function typeForEvent(eventType) {
   return 'system';
 }
 
+// --------------------------------------------------
+// Order event → chat thread system message
+// --------------------------------------------------
+const ORDER_EVENT_MESSAGES = {
+  pending:         'Order placed — finding a partner',
+  searching:       'Searching for the nearest partner',
+  assigned:        'You received a new order to deliver',
+  accepted:        'Agent accepted the order',
+  out_for_delivery:'Your order is on the way',
+  delivered:       'Order delivered — please confirm receipt',
+  confirmed:       'Customer confirmed receipt',
+  paid:            'Payment received — order closed',
+  cash_collected:  'Cash received — order closed',
+  cancelled:       'Order cancelled',
+  declined:        'Agent declined the order',
+};
+
+/**
+ * Append a system message to the order's chat thread.
+ * Silent no-op if the thread doesn't exist or the status is unknown.
+ */
+async function appendOrderChatMessage(order, status, { client = null } = {}) {
+  if (!order?.id) return;
+  const body = ORDER_EVENT_MESSAGES[status];
+  if (!body) return;
+
+  const runner = client || pool;
+  try {
+    // Find the order's thread
+    const threadRes = await runner.query(
+      `SELECT id FROM chat_threads WHERE order_id = $1 LIMIT 1`,
+      [order.id]
+    );
+    if (threadRes.rows.length === 0) return;
+
+    const threadId = threadRes.rows[0].id;
+
+    // Insert the system message
+    await runner.query(
+      `INSERT INTO chat_messages
+         (thread_id, sender_id, sender_role, body, created_at)
+       VALUES ($1, NULL, 'system', $2, NOW())`,
+      [threadId, body]
+    );
+
+    // Update the thread's last-message fields so it surfaces at the top
+    // of the thread list
+    await runner.query(
+      `UPDATE chat_threads
+       SET last_message_at = NOW(),
+           last_message_preview = LEFT($1, 200),
+           updated_at = NOW()
+       WHERE id = $2`,
+      [body, threadId]
+    );
+  } catch (err) {
+    // Best-effort — never crash the caller
+    console.error('appendOrderChatMessage failed:', err.message);
+  }
+}
+
 /**
  * Create a notification, then fire a push for it.
  *
@@ -48,7 +109,6 @@ async function createNotification({
   const { title, body, payload } = render(templateKey, ctx);
   const basePayload = payloadOverride || payload;
 
-  // Merge event + group_key into the `data` jsonb
   const data = {
     ...basePayload,
     event: eventType,
@@ -58,10 +118,6 @@ async function createNotification({
   const runner = client || pool;
 
   try {
-    // All parameters are explicitly cast so Postgres can resolve their
-    // types unambiguously.
-    //
-    // Dedup: skip if the same event for the same user in the same minute exists.
     const { rows } = await runner.query(
       `
       INSERT INTO notifications
@@ -97,11 +153,7 @@ async function createNotification({
 
     const notification = rows[0] || null;
 
-    // If the dedup window caught a duplicate, rows[0] is undefined.
-    // In that case there's nothing to push — the notification was
-    // already sent moments ago.
     if (notification && !skipPush) {
-      // Fire-and-forget. Any error is logged but never thrown.
       sendPushToUser(userId, {
         title,
         body,
@@ -116,7 +168,6 @@ async function createNotification({
 
     return notification;
   } catch (err) {
-    // Notifications are best-effort; never crash the caller's transaction.
     console.error('createNotification failed:', err.message);
     return null;
   }
@@ -134,11 +185,10 @@ async function createNotificationForMany({ userIds, ...rest }) {
 }
 
 /**
- * Fire the correct notification(s) for an order event.
- * Called from every route that changes order status.
+ * Fire the correct notification(s) for an order event, AND append a system
+ * message to the order's chat thread so the thread shows the full timeline.
  *
- * In this schema, `agents.id` IS `users.id` (FK: agents_id_fkey → users.id),
- * so `order.agent_id` is directly usable as `notifications.user_id`.
+ * Called from every route that changes order status.
  *
  * @param {object} order   full order row (id, order_number, customer_id, agent_id)
  * @param {string} status  new status
@@ -155,7 +205,7 @@ async function notifyOrderEvent(order, status, opts = {}) {
     status,
   };
 
-  // ---- Customer ----
+  // ---- Customer notification ----
   if (order.customer_id) {
     await createNotification({
       userId: order.customer_id,
@@ -167,7 +217,7 @@ async function notifyOrderEvent(order, status, opts = {}) {
     });
   }
 
-  // ---- Agent ----
+  // ---- Agent notification ----
   // agents.id === users.id, so use order.agent_id directly. No lookup needed.
   if (order.agent_id) {
     await createNotification({
@@ -179,6 +229,10 @@ async function notifyOrderEvent(order, status, opts = {}) {
       client,
     });
   }
+
+  // ---- Append a system message to the order's chat thread ----
+  // One message per event, seen by both parties (same thread).
+  await appendOrderChatMessage(order, status, { client });
 }
 
 /**
@@ -262,6 +316,7 @@ module.exports = {
   createNotification,
   createNotificationForMany,
   notifyOrderEvent,
+  appendOrderChatMessage,
   listNotifications,
   unreadCount,
   markRead,

@@ -57,7 +57,7 @@ router.get('/threads', async (req, res) => {
         (
           SELECT COUNT(*)::int FROM chat_messages m
           WHERE m.thread_id = t.id
-            AND m.sender_id <> $1
+            AND (m.sender_id IS NULL OR m.sender_id <> $1)
             AND m.read_at IS NULL
         ) AS unread_count
       FROM chat_threads t
@@ -100,7 +100,7 @@ router.get('/threads/:id', async (req, res) => {
         (
           SELECT COUNT(*)::int FROM chat_messages m
           WHERE m.thread_id = t.id
-            AND m.sender_id <> $1
+            AND (m.sender_id IS NULL OR m.sender_id <> $1)
             AND m.read_at IS NULL
         ) AS unread_count
       FROM chat_threads t
@@ -131,6 +131,8 @@ router.get('/threads/:id', async (req, res) => {
 
 // =====================================================
 // POST /api/chat/threads
+// Idempotent: returns the existing thread if one exists,
+// otherwise creates one and posts the opening system message.
 // =====================================================
 router.post('/threads', async (req, res) => {
   const client = await pool.connect();
@@ -167,7 +169,7 @@ router.post('/threads', async (req, res) => {
 
       const finalSubject = (subject || '').trim() || 'Support request';
 
-      const { rows } = await client.query(
+      const inserted = await client.query(
         `INSERT INTO chat_threads
            (type, customer_id, status, subject, category, priority, created_at, updated_at)
          VALUES ('support', $1, 'open', $2, $3, $4, NOW(), NOW())
@@ -175,13 +177,35 @@ router.post('/threads', async (req, res) => {
         [userId, finalSubject, category, priority]
       );
 
+      const thread = inserted.rows[0];
+
+      // Opening system message
+      const openingBody = `Support request opened · ${finalSubject}`;
+      await client.query(
+        `INSERT INTO chat_messages
+           (thread_id, sender_id, sender_role, body, created_at)
+         VALUES ($1, NULL, 'system', $2, NOW())`,
+        [thread.id, openingBody]
+      );
+
+      // Update thread's last message preview
+      await client.query(
+        `UPDATE chat_threads
+         SET last_message_at = NOW(),
+             last_message_preview = LEFT($1, 200),
+             updated_at = NOW()
+         WHERE id = $2`,
+        [openingBody, thread.id]
+      );
+
       await client.query('COMMIT');
-      return res.json(rows[0]);
+      return res.status(201).json(thread);
     }
 
     // ---------- ORDER THREAD ----------
     const orderRes = await client.query(
-      `SELECT id, customer_id, agent_id, order_number FROM orders WHERE id = $1`,
+      `SELECT id, customer_id, agent_id, order_number
+       FROM orders WHERE id = $1`,
       [order_id]
     );
     if (orderRes.rows.length === 0) {
@@ -206,23 +230,36 @@ router.post('/threads', async (req, res) => {
 
     const finalSubject = (subject || '').trim() || `Order #${order.order_number}`;
 
-    const { rows } = await client.query(
+    const inserted = await client.query(
       `INSERT INTO chat_threads
          (type, order_id, customer_id, agent_id, status, subject, category, priority, created_at, updated_at)
-       VALUES ('order', $1, $2, $3, 'open', $4, $5, $6, NOW(), NOW())
+       VALUES ('order', $1, $2, $3, 'open', $4, 'order', $5, NOW(), NOW())
        RETURNING *`,
-      [
-        order_id,
-        order.customer_id,
-        order.agent_id,
-        finalSubject,
-        category === 'other' ? 'order' : category,
-        priority,
-      ]
+      [order_id, order.customer_id, order.agent_id, finalSubject, priority]
+    );
+
+    const thread = inserted.rows[0];
+
+    // Opening system message
+    const openingBody = `Order #${order.order_number} opened`;
+    await client.query(
+      `INSERT INTO chat_messages
+         (thread_id, sender_id, sender_role, body, created_at)
+       VALUES ($1, NULL, 'system', $2, NOW())`,
+      [thread.id, openingBody]
+    );
+
+    await client.query(
+      `UPDATE chat_threads
+       SET last_message_at = NOW(),
+           last_message_preview = LEFT($1, 200),
+           updated_at = NOW()
+       WHERE id = $2`,
+      [openingBody, thread.id]
     );
 
     await client.query('COMMIT');
-    res.status(201).json(rows[0]);
+    res.status(201).json(thread);
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('POST /chat/threads error:', err);
@@ -276,7 +313,7 @@ router.get('/threads/:id/messages', async (req, res) => {
         m.body, m.read_at, m.created_at,
         u.full_name AS sender_name
       FROM chat_messages m
-      JOIN users u ON u.id = m.sender_id
+      LEFT JOIN users u ON u.id = m.sender_id
       ${where}
       ORDER BY m.created_at DESC
       LIMIT $2
@@ -363,17 +400,12 @@ router.post('/threads/:id/messages', async (req, res) => {
     let templateKey = null;
 
     if (userType === 'customer') {
-      // Customer → agent (if assigned) or support inbox
       recipientId = thread.agent_id || null;
-      templateKey = isSupport
-        ? 'chat_customer_reply_agent'
-        : 'chat_customer_reply_agent';
+      templateKey = 'chat_customer_reply_agent';
     } else if (userType === 'agent') {
-      // Agent → customer
       recipientId = thread.customer_id || null;
       templateKey = isSupport ? 'chat_support_reply' : 'chat_order_reply';
     } else if (userType === 'admin') {
-      // Admin → customer
       recipientId = thread.customer_id || null;
       templateKey = 'chat_support_reply';
     }
@@ -404,26 +436,23 @@ router.post('/threads/:id/messages', async (req, res) => {
 
 // =====================================================
 // POST /api/chat/threads/:id/read
-// Marks messages as read AND clears the chat notifications.
 // =====================================================
 router.post('/threads/:id/read', async (req, res) => {
   try {
     const userId = req.user.id;
     const { id } = req.params;
 
-    // 1. Mark messages as read
     await pool.query(
       `
       UPDATE chat_messages
       SET read_at = NOW()
       WHERE thread_id = $1
-        AND sender_id <> $2
+        AND (sender_id IS NULL OR sender_id <> $2)
         AND read_at IS NULL
       `,
       [id, userId]
     );
 
-    // 2. Clear all notifications for this thread for this user
     await markGroupRead(userId, `thread:${id}`);
 
     res.json({ success: true });

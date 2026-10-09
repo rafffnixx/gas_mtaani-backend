@@ -1,24 +1,50 @@
 // 📁 backend/src/routes/customer.routes.js
 const express = require('express');
 const router = express.Router();
+const crypto = require('crypto');
 const { pool } = require('../config/database');
 const { authenticate } = require('../middleware/auth.middleware');
 
 router.use(authenticate);
 
+// Business WhatsApp number — change here, used by mobile via /request-pin
+const BUSINESS_WHATSAPP = process.env.BUSINESS_WHATSAPP || '2547115016167';
+
+// How long a pending pin stays alive before it's auto-purged
+const PENDING_PIN_TTL_MINUTES = 30;
+
 // =====================================================
 // GET /api/customers/addresses
+// Also purges expired whatsapp_pending rows (older than TTL).
 // =====================================================
 router.get('/addresses', async (req, res) => {
   try {
     const userId = req.user.id;
+
+    // Clean up stale pending pins for this user
+    await pool.query(
+      `DELETE FROM customer_addresses
+       WHERE user_id = $1
+         AND location_source = 'whatsapp_pending'
+         AND created_at < NOW() - ($2 || ' minutes')::interval`,
+      [userId, String(PENDING_PIN_TTL_MINUTES)]
+    );
+
     const { rows } = await pool.query(
       `SELECT id, label, address, latitude, longitude, location_source,
               county_code, constituency_code, ward_code, area_name, landmark,
               instructions, is_default, created_at
        FROM customer_addresses
        WHERE user_id = $1
-       ORDER BY is_default DESC, created_at DESC`,
+       ORDER BY
+         CASE location_source
+           WHEN 'whatsapp_pending' THEN 0
+           WHEN 'whatsapp'         THEN 1
+           WHEN 'gps'              THEN 2
+           ELSE 3
+         END,
+         is_default DESC,
+         created_at DESC`,
       [userId]
     );
     res.json(rows);
@@ -29,7 +55,63 @@ router.get('/addresses', async (req, res) => {
 });
 
 // =====================================================
-// POST /api/customers/addresses  (create or update)
+// POST /api/customers/addresses/request-pin
+// Creates a whatsapp_pending row (or reuses an existing one)
+// and returns the WhatsApp deep-link the mobile app should open.
+// =====================================================
+router.post('/addresses/request-pin', async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // Reuse any recent pending pin for this user
+    const existing = await pool.query(
+      `SELECT id FROM customer_addresses
+       WHERE user_id = $1
+         AND location_source = 'whatsapp_pending'
+         AND created_at > NOW() - ($2 || ' minutes')::interval
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [userId, String(PENDING_PIN_TTL_MINUTES)]
+    );
+
+    let pinId;
+    if (existing.rows.length > 0) {
+      pinId = existing.rows[0].id;
+    } else {
+      pinId = `pin-${crypto.randomUUID()}`;
+      await pool.query(
+        `INSERT INTO customer_addresses
+           (id, user_id, label, address, location_source, is_default)
+         VALUES ($1, $2, $3, $4, $5, false)`,
+        [pinId, userId, 'WhatsApp Pin', 'Awaiting pin…', 'whatsapp_pending']
+      );
+    }
+
+    // Look up the customer's name for the WhatsApp template
+    const u = await pool.query(
+      `SELECT full_name, phone_number FROM users WHERE id = $1`,
+      [userId]
+    );
+    const customer = u.rows[0] || {};
+
+    const message =
+      `Hi Gas Mtaani, I want to place an order and share my delivery pin.\n\n` +
+      `Name: ${customer.full_name || ''}\n` +
+      `Phone: ${customer.phone_number || ''}\n` +
+      `Pin ref: ${pinId}\n\n` +
+      `Please tap the attachment 📎 → Location → Send your current location.`;
+
+    const waUrl = `https://wa.me/${BUSINESS_WHATSAPP}?text=${encodeURIComponent(message)}`;
+
+    res.json({ pin_id: pinId, wa_url: waUrl });
+  } catch (err) {
+    console.error('POST /customers/addresses/request-pin error:', err);
+    res.status(500).json({ error: 'Failed to start pin request' });
+  }
+});
+
+// =====================================================
+// POST /api/customers/addresses  (create or update — unchanged)
 // =====================================================
 router.post('/addresses', async (req, res) => {
   const client = await pool.connect();
@@ -98,7 +180,7 @@ router.post('/addresses', async (req, res) => {
 });
 
 // =====================================================
-// PUT /api/customers/addresses/:id/default
+// PUT /api/customers/addresses/:id/default  (unchanged)
 // =====================================================
 router.put('/addresses/:id/default', async (req, res) => {
   const client = await pool.connect();
@@ -135,7 +217,7 @@ router.put('/addresses/:id/default', async (req, res) => {
 });
 
 // =====================================================
-// DELETE /api/customers/addresses/:id
+// DELETE /api/customers/addresses/:id  (unchanged)
 // =====================================================
 router.delete('/addresses/:id', async (req, res) => {
   try {

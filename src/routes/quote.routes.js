@@ -22,7 +22,10 @@ router.post('/quote', authenticate, async (req, res) => {
   try {
     const { lat, lng, items } = req.body;
 
+    console.log('[quote] body:', JSON.stringify({ lat, lng, items }));
+
     if (!lat || !lng || !Array.isArray(items) || items.length === 0) {
+      console.log('[quote] 400 — missing fields');
       return res.status(400).json({
         error: 'lat, lng and items[] are required',
       });
@@ -32,6 +35,10 @@ router.post('/quote', authenticate, async (req, res) => {
     const productIds = items.map((i) => i.product_id);
     const productCount = items.length;
 
+    console.log('[quote] customerId:', customerId);
+    console.log('[quote] productIds:', productIds);
+    console.log('[quote] productCount:', productCount);
+
     // Resolve product prices once
     const { rows: products } = await client.query(
       `SELECT id, name, brand_name, base_price, image_url
@@ -39,7 +46,9 @@ router.post('/quote', authenticate, async (req, res) => {
        WHERE id = ANY($1::uuid[]) AND is_active = true`,
       [productIds]
     );
+    console.log('[quote] products found:', products.length, 'of', productIds.length);
     if (products.length !== productIds.length) {
+      console.log('[quote] 404 — some products not found or inactive');
       return res.status(404).json({ error: 'One or more products not found' });
     }
     const productMap = Object.fromEntries(products.map((p) => [p.id, p]));
@@ -47,6 +56,9 @@ router.post('/quote', authenticate, async (req, res) => {
     // Walk the rings from 1 to MAX_RING, find the first ring that has
     // at least one online, approved, in-stock agent covering ALL items.
     const customerHex = latLngToHex(Number(lat), Number(lng));
+
+    console.log('[quote] customerHex:', customerHex);
+    console.log('[quote] ring1 hexes:', hexesUpToRing(customerHex, 1));
 
     let chosen = null;
     let chosenRing = null;
@@ -83,6 +95,12 @@ router.post('/quote', authenticate, async (req, res) => {
         [hexes, productIds, productCount]
       );
 
+      console.log(
+        `[quote] ring ${ring} candidates:`,
+        candidates.length,
+        JSON.stringify(candidates)
+      );
+
       if (candidates.length > 0) {
         chosen = candidates[0];
         chosenRing = ring;
@@ -90,7 +108,10 @@ router.post('/quote', authenticate, async (req, res) => {
       }
     }
 
+    console.log('[quote] chosen:', JSON.stringify(chosen), 'ring:', chosenRing);
+
     if (!chosen) {
+      console.log('[quote] 404 — no partner available after all rings');
       return res.status(404).json({
         error: 'No partner available in your area right now',
         max_radius_km: approximateRadiusKm(MAX_RING),
@@ -162,6 +183,8 @@ router.post('/quote', authenticate, async (req, res) => {
         expiresAt,
       ]
     );
+
+    console.log('[quote] created quote', qrows[0].id, 'grand_total', grandTotal);
 
     // Customer-facing response — NO agent details
     return res.json({

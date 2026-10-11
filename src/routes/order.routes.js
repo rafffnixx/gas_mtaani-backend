@@ -3,49 +3,12 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/database');
 const { authenticate, isAgent } = require('../middleware/auth.middleware');
-const { latLngToHex, hexesUpToRing } = require('../utils/hexGrid');
 const { notifyOrderEvent } = require('../services/notificationService');
-
-// =====================================================
-// TIMERS — module-level so they survive across requests
-//
-// Every assigned order has a timer that fires after REASSIGN_AFTER_MS.
-// If the agent hasn't accepted by then, the order is reassigned to the
-// next eligible agent (with the previous one excluded).
-//
-// Every searching order has a timer that fires after SEARCH_TIMEOUT_MS.
-// If no agent has been found and accepted, the order is cancelled.
-//
-// Both timers are cleared on accept/decline/cancel/assign.
-// =====================================================
-const reassignTimers = new Map();   // orderId -> timeout handle
-const searchTimers   = new Map();   // orderId -> timeout handle
-
-// Defaults — override via env vars for testing
-const REASSIGN_AFTER_MS = Number(process.env.REASSIGN_AFTER_MS) || 3 * 60 * 1000;
-const SEARCH_TIMEOUT_MS = Number(process.env.SEARCH_TIMEOUT_MS) || 3 * 60 * 1000;
-const MAX_REASSIGNMENTS = Number(process.env.MAX_REASSIGNMENTS) || 2;
-
-function clearReassignTimer(orderId) {
-  const handle = reassignTimers.get(orderId);
-  if (handle) {
-    clearTimeout(handle);
-    reassignTimers.delete(orderId);
-  }
-}
-
-function clearSearchTimer(orderId) {
-  const handle = searchTimers.get(orderId);
-  if (handle) {
-    clearTimeout(handle);
-    searchTimers.delete(orderId);
-  }
-}
-
-function clearAllTimers(orderId) {
-  clearReassignTimer(orderId);
-  clearSearchTimer(orderId);
-}
+const {
+  runAgentSearch,
+  clearAllTimers,
+  scheduleSearchTimeout,
+} = require('../services/orderSearch');
 
 // =====================================================
 // CREATE ORDER (Customer)
@@ -85,6 +48,10 @@ router.post('/', authenticate, async (req, res) => {
     const chosenMethod = allowedMethods.includes(payment_method)
       ? payment_method
       : 'delivery';
+
+    // ─── Pesapal orders sit in 'pending' until payment confirms.
+    //     Everything else starts agent search immediately.
+    const initialStatus = chosenMethod === 'pesapal' ? 'pending' : 'searching';
 
     const qr = await client.query(
       `SELECT * FROM order_quotes
@@ -142,7 +109,7 @@ router.post('/', authenticate, async (req, res) => {
          $12,$13,
          $14,$15,$16,$17,$18,
          0,
-         'searching', 'pending', 0,
+         $19, 'pending', 0,
          '{}',
          NOW(), NOW()
        )
@@ -166,6 +133,7 @@ router.post('/', authenticate, async (req, res) => {
         ward_code || null,
         area_name || null,
         landmark || null,
+        initialStatus,
       ]
     );
     const order = orderRes.rows[0];
@@ -178,9 +146,6 @@ router.post('/', authenticate, async (req, res) => {
       );
     }
 
-    // ─── Create the order's chat thread ───
-    // One thread per order, shared by customer + agent.
-    // Inserted inside the transaction so it rolls back with the order.
     const threadRes = await client.query(
       `INSERT INTO chat_threads
          (type, order_id, customer_id, agent_id, status, subject,
@@ -191,8 +156,11 @@ router.post('/', authenticate, async (req, res) => {
     );
     const threadId = threadRes.rows[0].id;
 
-    // Opening system message
-    const openingBody = `Order #${orderNumber} placed — finding a partner`;
+    const openingBody =
+      chosenMethod === 'pesapal'
+        ? `Order #${orderNumber} placed — awaiting payment`
+        : `Order #${orderNumber} placed — finding a partner`;
+
     await client.query(
       `INSERT INTO chat_messages
          (thread_id, sender_id, sender_role, body, created_at)
@@ -206,7 +174,6 @@ router.post('/', authenticate, async (req, res) => {
        WHERE id = $2`,
       [openingBody, threadId]
     );
-    // ────────────────────────────────────────
 
     await client.query(
       `UPDATE order_quotes SET status = 'used' WHERE id = $1`,
@@ -215,24 +182,26 @@ router.post('/', authenticate, async (req, res) => {
 
     await client.query('COMMIT');
 
-    await notifyOrderEvent(order, 'pending');
+    await notifyOrderEvent(order, initialStatus);
 
-    // Kick off search, then start the search-timeout timer
-    runAgentSearch(order.id).catch((err) =>
-      console.error('runAgentSearch failed:', err)
-    );
-
-    const searchHandle = setTimeout(() => {
-      searchTimers.delete(order.id);
-      handleSearchTimeout(order.id).catch((err) =>
-        console.error('handleSearchTimeout failed:', err)
+    if (chosenMethod !== 'pesapal') {
+      // Pay on Delivery / Cash — dispatch immediately
+      runAgentSearch(order.id).catch((err) =>
+        console.error('runAgentSearch failed:', err)
       );
-    }, SEARCH_TIMEOUT_MS);
-    searchTimers.set(order.id, searchHandle);
+      scheduleSearchTimeout(order.id);
+    } else {
+      console.log(
+        `⏸  Order ${order.order_number} pending Pesapal payment — search deferred`
+      );
+    }
 
     return res.status(201).json({
       success: true,
-      message: 'Order placed — finding a partner',
+      message:
+        chosenMethod === 'pesapal'
+          ? 'Order created — complete payment to dispatch'
+          : 'Order placed — finding a partner',
       order: {
         id: order.id,
         order_number: order.order_number,
@@ -253,321 +222,6 @@ router.post('/', authenticate, async (req, res) => {
     client.release();
   }
 });
-
-// =====================================================
-// BACKGROUND: Find an agent for this order.
-// Excludes agents in orders.excluded_agent_ids.
-// =====================================================
-async function runAgentSearch(orderId) {
-  try {
-    const { rows } = await pool.query(
-      `SELECT id, customer_latitude, customer_longitude, status,
-              excluded_agent_ids, reassignment_count
-       FROM orders WHERE id = $1`,
-      [orderId]
-    );
-    if (rows.length === 0) return;
-    const order = rows[0];
-
-    if (order.status !== 'searching') return;
-
-    if (order.customer_latitude == null || order.customer_longitude == null) {
-      console.warn(`Order ${orderId} has no coords — cannot search`);
-      return;
-    }
-
-    const lat = Number(order.customer_latitude);
-    const lng = Number(order.customer_longitude);
-    const excluded = order.excluded_agent_ids || [];
-
-    const itemsRes = await pool.query(
-      `SELECT product_id, quantity FROM order_items WHERE order_id = $1`,
-      [orderId]
-    );
-    const items = itemsRes.rows;
-    if (items.length === 0) return;
-
-    const productIds = items.map((i) => i.product_id);
-    const itemCount = items.length;
-
-    const customerHex = latLngToHex(lat, lng);
-
-    for (let ring = 1; ring <= 4; ring++) {
-      const hexes = hexesUpToRing(customerHex, ring);
-
-      const { rows: candidates } = await pool.query(
-        `
-        SELECT
-          a.id                AS agent_id,
-          a.partner_code,
-          a.rating,
-          a.current_order_count,
-          COUNT(DISTINCT ai.product_id) AS items_covered
-        FROM agents a
-        JOIN agent_inventory ai ON ai.agent_id = a.id
-        WHERE a.hex_id = ANY($1::bigint[])
-          AND a.is_online = true
-          AND a.is_approved = true
-          AND a.current_order_count < a.max_order_capacity
-          AND ai.product_id = ANY($2::uuid[])
-          AND ai.stock_quantity > 0
-          AND NOT (a.id = ANY($4::uuid[]))
-        GROUP BY a.id, a.partner_code, a.rating, a.current_order_count
-        HAVING COUNT(DISTINCT ai.product_id) = $3
-        ORDER BY a.current_order_count ASC, a.rating DESC NULLS LAST
-        LIMIT 1
-        `,
-        [hexes, productIds, itemCount, excluded]
-      );
-
-      if (candidates.length > 0) {
-        const agent = candidates[0];
-
-        const client = await pool.connect();
-        try {
-          await client.query('BEGIN');
-
-          const lock = await client.query(
-            `SELECT status FROM orders WHERE id = $1 FOR UPDATE`,
-            [orderId]
-          );
-          if (lock.rows[0]?.status !== 'searching') {
-            await client.query('ROLLBACK');
-            return;
-          }
-
-          for (const item of items) {
-            const inv = await client.query(
-              `SELECT id, stock_quantity FROM agent_inventory
-               WHERE agent_id = $1 AND product_id = $2
-               FOR UPDATE`,
-              [agent.agent_id, item.product_id]
-            );
-            if (
-              inv.rows.length === 0 ||
-              inv.rows[0].stock_quantity < item.quantity
-            ) {
-              await client.query('ROLLBACK');
-              throw new Error('Stock changed during assignment');
-            }
-            await client.query(
-              `UPDATE agent_inventory
-               SET stock_quantity = stock_quantity - $1,
-                   is_available = CASE
-                     WHEN stock_quantity - $1 <= 0 THEN false
-                     ELSE is_available
-                   END,
-                   updated_at = NOW()
-               WHERE id = $2`,
-              [item.quantity, inv.rows[0].id]
-            );
-          }
-
-          const assignedRes = await client.query(
-            `UPDATE orders
-             SET agent_id = $1,
-                 assigned_partner_code = $2,
-                 hex_ring = $3,
-                 status = 'assigned',
-                 assigned_at = NOW(),
-                 last_assigned_at = NOW(),
-                 updated_at = NOW()
-             WHERE id = $4
-             RETURNING *`,
-            [agent.agent_id, agent.partner_code, ring, orderId]
-          );
-
-          // Link the thread to the agent so they see it in their list
-          await client.query(
-            `UPDATE chat_threads
-             SET agent_id = $1, updated_at = NOW()
-             WHERE order_id = $2 AND agent_id IS NULL`,
-            [agent.agent_id, orderId]
-          );
-
-          await client.query(
-            `UPDATE agents
-             SET current_order_count = current_order_count + 1,
-                 updated_at = NOW()
-             WHERE id = $1`,
-            [agent.agent_id]
-          );
-
-          await client.query('COMMIT');
-
-          await notifyOrderEvent(assignedRes.rows[0], 'assigned');
-
-          // Clear the search timer — we have an agent
-          clearSearchTimer(orderId);
-
-          // Start the reassignment timer — 3 min for the agent to accept
-          const handle = setTimeout(() => {
-            reassignTimers.delete(orderId);
-            handleReassignment(orderId).catch((err) =>
-              console.error('handleReassignment failed:', err)
-            );
-          }, REASSIGN_AFTER_MS);
-          reassignTimers.set(orderId, handle);
-
-          console.log(
-            `✅ Order ${orderId} assigned to ${agent.partner_code} (ring ${ring})`
-          );
-          return;
-        } catch (err) {
-          console.error('Assignment transaction failed:', err.message);
-        } finally {
-          client.release();
-        }
-      }
-    }
-
-    console.log(`❌ No agent found for order ${orderId} on this pass`);
-  } catch (err) {
-    console.error('runAgentSearch error:', err);
-  }
-}
-
-// =====================================================
-// Reassignment handler
-// =====================================================
-async function handleReassignment(orderId) {
-  try {
-    const { rows } = await pool.query(
-      `SELECT id, status, agent_id, reassignment_count,
-              excluded_agent_ids, order_number
-       FROM orders WHERE id = $1`,
-      [orderId]
-    );
-    if (rows.length === 0) return;
-    const order = rows[0];
-
-    if (order.status !== 'assigned') {
-      console.log(
-        `⏭  Reassignment skipped for ${order.order_number} (status=${order.status})`
-      );
-      return;
-    }
-
-    const newExcluded = [
-      ...(order.excluded_agent_ids || []),
-      order.agent_id,
-    ].filter(Boolean);
-
-    if ((order.reassignment_count || 0) >= MAX_REASSIGNMENTS) {
-      const cancelled = await pool.query(
-        `UPDATE orders
-         SET status = 'cancelled',
-             cancellation_reason = 'no_agent_available',
-             cancelled_at = NOW(),
-             excluded_agent_ids = $2::uuid[],
-             reassignment_count = reassignment_count + 1,
-             updated_at = NOW()
-         WHERE id = $1 AND status = 'assigned'
-         RETURNING *`,
-        [orderId, newExcluded]
-      );
-
-      await pool.query(
-        `UPDATE agents
-         SET current_order_count = GREATEST(0, current_order_count - 1),
-             updated_at = NOW()
-         WHERE id = $1`,
-        [order.agent_id]
-      );
-
-      clearAllTimers(orderId);
-
-      if (cancelled.rows[0]) {
-        await notifyOrderEvent(cancelled.rows[0], 'cancelled');
-        console.log(
-          `⏱  Order ${order.order_number} cancelled — no agent accepted after ${MAX_REASSIGNMENTS + 1} attempts`
-        );
-      }
-      return;
-    }
-
-    const reset = await pool.query(
-      `UPDATE orders
-       SET status = 'searching',
-           agent_id = NULL,
-           assigned_partner_code = NULL,
-           assigned_at = NULL,
-           hex_ring = NULL,
-           excluded_agent_ids = $2::uuid[],
-           reassignment_count = reassignment_count + 1,
-           updated_at = NOW()
-       WHERE id = $1 AND status = 'assigned'
-       RETURNING *`,
-      [orderId, newExcluded]
-    );
-
-    // Unlink the thread from the unresponsive agent
-    await pool.query(
-      `UPDATE chat_threads
-       SET agent_id = NULL, updated_at = NOW()
-       WHERE order_id = $1`,
-      [orderId]
-    );
-
-    await pool.query(
-      `UPDATE agents
-       SET current_order_count = GREATEST(0, current_order_count - 1),
-           updated_at = NOW()
-       WHERE id = $1`,
-      [order.agent_id]
-    );
-
-    if (reset.rows[0]) {
-      await notifyOrderEvent(reset.rows[0], 'searching');
-      console.log(
-        `🔄 Order ${order.order_number} reassigned (attempt ${(order.reassignment_count || 0) + 1}/${MAX_REASSIGNMENTS})`
-      );
-
-      runAgentSearch(orderId).catch((err) =>
-        console.error('Reassign search failed:', err)
-      );
-
-      const handle = setTimeout(() => {
-        searchTimers.delete(orderId);
-        handleSearchTimeout(orderId).catch((err) =>
-          console.error('handleSearchTimeout failed:', err)
-        );
-      }, SEARCH_TIMEOUT_MS);
-      searchTimers.set(orderId, handle);
-    }
-  } catch (err) {
-    console.error('handleReassignment error:', err);
-  }
-}
-
-// =====================================================
-// Search timeout
-// =====================================================
-async function handleSearchTimeout(orderId) {
-  try {
-    const result = await pool.query(
-      `UPDATE orders
-       SET status = 'cancelled',
-           cancellation_reason = 'no_agent_available',
-           cancelled_at = NOW(),
-           updated_at = NOW()
-       WHERE id = $1 AND status = 'searching'
-       RETURNING *`,
-      [orderId]
-    );
-
-    clearAllTimers(orderId);
-
-    if (result.rows[0]) {
-      await notifyOrderEvent(result.rows[0], 'cancelled');
-      console.log(
-        `⏱  Order ${result.rows[0].order_number} cancelled — no agent available in radius`
-      );
-    }
-  } catch (err) {
-    console.error('handleSearchTimeout error:', err);
-  }
-}
 
 // =====================================================
 // GET CUSTOMER ORDERS
@@ -973,12 +627,6 @@ router.post('/:orderId/pay-online', authenticate, async (req, res) => {
         error: 'This is not a Pesapal order',
       });
     }
-    if (order.status !== 'confirmed') {
-      return res.status(400).json({
-        error: 'Confirm receipt before paying',
-        status: order.status,
-      });
-    }
     if (order.payment_status === 'paid') {
       return res.status(400).json({ error: 'Already paid' });
     }
@@ -1285,7 +933,6 @@ router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
       [orderId, newExcluded]
     );
 
-    // Unlink thread from this agent
     await client.query(
       `UPDATE chat_threads
        SET agent_id = NULL, updated_at = NOW()
@@ -1310,14 +957,7 @@ router.put('/:orderId/decline', authenticate, isAgent, async (req, res) => {
     runAgentSearch(orderId).catch((err) =>
       console.error('Post-decline search failed:', err)
     );
-
-    const handle = setTimeout(() => {
-      searchTimers.delete(orderId);
-      handleSearchTimeout(orderId).catch((err) =>
-        console.error('handleSearchTimeout failed:', err)
-      );
-    }, SEARCH_TIMEOUT_MS);
-    searchTimers.set(orderId, handle);
+    scheduleSearchTimeout(orderId);
 
     res.json({
       success: true,

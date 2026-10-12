@@ -699,16 +699,13 @@ router.put('/:orderId/collect-cash', authenticate, isAgent, async (req, res) => 
     const netFromItems = itemsTotal - commission;
     const netAmount = netFromItems + extendedFee;
 
-    // ── Cash settlement: agent collected the full amount, so they owe commission.
-    //    Credit their wallet with the net (same as before), AND debit the
-    //    commission so the outstanding balance shows up correctly.
-    //    net effect on wallet_balance = -commission.
+    // ── Wallet: cash order, agent already has the money → they owe commission.
+    //    Debit the wallet by the commission only.
     await client.query(
       `UPDATE agents
        SET current_order_count = GREATEST(0, current_order_count - 1),
            total_deliveries = total_deliveries + 1,
            total_earnings = total_earnings + $1,
-           available_balance = available_balance + $1,
            wallet_balance = wallet_balance - $2,
            updated_at = NOW()
        WHERE id = $3`,
@@ -728,7 +725,6 @@ router.put('/:orderId/collect-cash', authenticate, isAgent, async (req, res) => 
       ]
     );
 
-    // Wallet ledger: one CASH_COMMISSION debit
     await client.query(
       `INSERT INTO wallet_ledger (agent_id, order_id, type, amount, balance_after)
        SELECT $1, $2, 'CASH_COMMISSION', $3, wallet_balance
@@ -830,12 +826,12 @@ router.put(
       const netFromItems = itemsTotal - commission;
       const netAmount = netFromItems + extendedFee;
 
+      // ── Wallet: online order, agent earns the net amount.
       await client.query(
         `UPDATE agents
          SET current_order_count = GREATEST(0, current_order_count - 1),
              total_deliveries = total_deliveries + 1,
              total_earnings = total_earnings + $1,
-             available_balance = available_balance + $1,
              wallet_balance = wallet_balance + $1,
              updated_at = NOW()
          WHERE id = $2`,
@@ -855,7 +851,6 @@ router.put(
         ]
       );
 
-      // Wallet ledger: agent earns net on M-Pesa/Pesapal orders
       await client.query(
         `INSERT INTO wallet_ledger (agent_id, order_id, type, amount, balance_after)
          SELECT $1, $2, 'MPESA_EARNING', $3, wallet_balance

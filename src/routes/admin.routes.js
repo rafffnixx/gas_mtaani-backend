@@ -4,6 +4,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/database');
 const { authenticate, isAdmin } = require('../middleware/auth.middleware');
+const walletService = require('../services/walletService');
 
 // Apply JWT + admin role check to every route in this file
 router.use(authenticate);
@@ -132,10 +133,6 @@ router.get('/customers/list', isAdmin, async (req, res) => {
 });
 
 // GET customers
-
-// ============================================
-// GET CUSTOMERS - FIXED with order counts
-// ============================================
 router.get('/customers', isAdmin, async (req, res) => {
     try {
         const result = await pool.query(`
@@ -254,15 +251,7 @@ router.put('/customers/:id/toggle-status', isAdmin, async (req, res) => {
     }
 });
 
-// 📁 backend/src/routes/admin.routes.js
-
-// Add these routes after the existing customer routes
-
-// ============================================
-// CUSTOMER PROFILE - ADD THESE ROUTES
-// ============================================
-
-// GET customer orders
+// Customer profile sub-resources
 router.get('/customers/:id/orders', isAdmin, async (req, res) => {
     try {
         const { id } = req.params;
@@ -293,7 +282,6 @@ router.get('/customers/:id/orders', isAdmin, async (req, res) => {
     }
 });
 
-// GET customer payments
 router.get('/customers/:id/payments', isAdmin, async (req, res) => {
     try {
         const { id } = req.params;
@@ -314,16 +302,13 @@ router.get('/customers/:id/payments', isAdmin, async (req, res) => {
         res.json(result.rows);
     } catch (error) {
         console.error('Error fetching customer payments:', error);
-        // Return empty array if payments table doesn't exist
         res.json([]);
     }
 });
 
-// GET customer chats
 router.get('/customers/:id/chats', isAdmin, async (req, res) => {
     try {
         const { id } = req.params;
-        // Check if chat table exists
         const tableCheck = await pool.query(`
             SELECT EXISTS (
                 SELECT FROM information_schema.tables 
@@ -355,11 +340,9 @@ router.get('/customers/:id/chats', isAdmin, async (req, res) => {
     }
 });
 
-// GET customer support tickets
 router.get('/customers/:id/tickets', isAdmin, async (req, res) => {
     try {
         const { id } = req.params;
-        // Check if support_tickets table exists
         const tableCheck = await pool.query(`
             SELECT EXISTS (
                 SELECT FROM information_schema.tables 
@@ -392,12 +375,10 @@ router.get('/customers/:id/tickets', isAdmin, async (req, res) => {
     }
 });
 
-
 // ============================================
 // ✅ AGENTS - SPECIFIC ROUTES FIRST
 // ============================================
 
-// GET agents list (for dropdown) - MUST come before /agents/:id
 router.get('/agents/list', isAdmin, async (req, res) => {
     try {
         const result = await pool.query(`
@@ -423,12 +404,6 @@ router.get('/agents/list', isAdmin, async (req, res) => {
     }
 });
 
-// GET agents
-// 📁 backend/src/routes/admin.routes.js
-
-// ============================================
-// GET AGENTS - FIXED with proper delivery counts
-// ============================================
 router.get('/agents', isAdmin, async (req, res) => {
     try {
         const result = await pool.query(`
@@ -487,7 +462,6 @@ router.get('/agents/pending', isAdmin, async (req, res) => {
     }
 });
 
-// GET agent by ID - parameter route
 router.get('/agents/:id', isAdmin, async (req, res) => {
     try {
         const { id } = req.params;
@@ -579,11 +553,6 @@ router.put('/agents/:id/unban', isAdmin, async (req, res) => {
     }
 });
 
-// 📁 backend/src/routes/admin.routes.js
-
-// ============================================
-// GET AGENT ORDERS - ADD THIS ENDPOINT
-// ============================================
 router.get('/agents/:id/orders', isAdmin, async (req, res) => {
     try {
         const { id } = req.params;
@@ -619,9 +588,6 @@ router.get('/agents/:id/orders', isAdmin, async (req, res) => {
     }
 });
 
-// ============================================
-// GET AGENT PAYMENTS - ADD THIS ENDPOINT
-// ============================================
 router.get('/agents/:id/payments', isAdmin, async (req, res) => {
     try {
         const { id } = req.params;
@@ -647,14 +613,10 @@ router.get('/agents/:id/payments', isAdmin, async (req, res) => {
     }
 });
 
-// ============================================
-// GET AGENT CHATS - ADD THIS ENDPOINT
-// ============================================
 router.get('/agents/:id/chats', isAdmin, async (req, res) => {
     try {
         const { id } = req.params;
         
-        // Check if chats table exists
         const tableCheck = await pool.query(`
             SELECT EXISTS (
                 SELECT FROM information_schema.tables 
@@ -687,14 +649,10 @@ router.get('/agents/:id/chats', isAdmin, async (req, res) => {
     }
 });
 
-// ============================================
-// GET AGENT SUPPORT TICKETS - ADD THIS ENDPOINT
-// ============================================
 router.get('/agents/:id/tickets', isAdmin, async (req, res) => {
     try {
         const { id } = req.params;
         
-        // Check if support_tickets table exists
         const tableCheck = await pool.query(`
             SELECT EXISTS (
                 SELECT FROM information_schema.tables 
@@ -728,10 +686,8 @@ router.get('/agents/:id/tickets', isAdmin, async (req, res) => {
 });
 
 // ============================================
-// ✅ PRODUCTS - SPECIFIC ROUTES FIRST
+// ✅ PRODUCTS
 // ============================================
-
-// GET products list (for dropdown) - MUST come before /products/:id
 router.get('/products/list', isAdmin, async (req, res) => {
     try {
         const result = await pool.query(`
@@ -756,7 +712,6 @@ router.get('/products/list', isAdmin, async (req, res) => {
     }
 });
 
-// GET products
 router.get('/products', isAdmin, async (req, res) => {
     try {
         const result = await pool.query(
@@ -769,7 +724,6 @@ router.get('/products', isAdmin, async (req, res) => {
     }
 });
 
-// GET product by ID - parameter route
 router.get('/products/:id', isAdmin, async (req, res) => {
     try {
         const { id } = req.params;
@@ -972,7 +926,6 @@ router.get('/orders', isAdmin, async (req, res) => {
     }
 });
 
-// GET order by ID - parameter route
 router.get('/orders/:id', isAdmin, async (req, res) => {
     try {
         const { id } = req.params;
@@ -1082,11 +1035,6 @@ router.put('/orders/:id/cancel', isAdmin, async (req, res) => {
     }
 });
 
-// 📁 backend/src/routes/admin.routes.js
-
-// ============================================
-// ASSIGN AGENT TO ORDER - FIXED (sets status to assigned)
-// ============================================
 router.put('/orders/:id/assign-agent', isAdmin, async (req, res) => {
     try {
         const { id } = req.params;
@@ -1101,7 +1049,6 @@ router.put('/orders/:id/assign-agent', isAdmin, async (req, res) => {
             });
         }
         
-        // 1. Check if order exists
         const orderCheck = await pool.query(
             'SELECT id, status FROM orders WHERE id = $1',
             [id]
@@ -1116,7 +1063,6 @@ router.put('/orders/:id/assign-agent', isAdmin, async (req, res) => {
         
         console.log('📦 Current order status:', orderCheck.rows[0].status);
         
-        // 2. Check if agent exists and is approved
         const agentCheck = await pool.query(
             'SELECT id, business_name FROM agent_profiles WHERE id = $1 AND is_approved = true',
             [agent_id]
@@ -1131,12 +1077,11 @@ router.put('/orders/:id/assign-agent', isAdmin, async (req, res) => {
         
         console.log('✅ Agent found:', agentCheck.rows[0].business_name);
         
-        // 3. ✅ FIXED: Update order with agent AND set status to 'assigned'
         const result = await pool.query(
             `UPDATE orders 
              SET 
                  agent_id = $1, 
-                 status = 'assigned',        -- ← This is the key fix!
+                 status = 'assigned',
                  assigned_at = CURRENT_TIMESTAMP,
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = $2
@@ -1170,19 +1115,6 @@ router.put('/orders/:id/assign-agent', isAdmin, async (req, res) => {
     }
 });
 
-// ============================================
-// ADMIN CREATE ORDER FOR CUSTOMER
-// ============================================
-// 📁 backend/src/routes/admin.routes.js
-
-// ============================================
-// ADMIN CREATE ORDER FOR CUSTOMER - FIXED
-// ============================================
-
-
-// ============================================
-// ADMIN CREATE ORDER FOR CUSTOMER - WITH DIRECT AGENT ASSIGNMENT
-// ============================================
 router.post('/orders/create', isAdmin, async (req, res) => {
     const client = await pool.connect();
     try {
@@ -1202,7 +1134,6 @@ router.post('/orders/create', isAdmin, async (req, res) => {
 
         console.log('📦 Create order request:', JSON.stringify(req.body, null, 2));
 
-        // 1. Check customer exists
         const customerCheck = await client.query(
             'SELECT id, full_name, phone_number FROM users WHERE id = $1 AND user_type = \'customer\' AND is_active = true',
             [customer_id]
@@ -1219,7 +1150,6 @@ router.post('/orders/create', isAdmin, async (req, res) => {
         const customer = customerCheck.rows[0];
         console.log('✅ Customer found:', customer.full_name);
         
-        // 2. Check product exists
         const productCheck = await client.query(
             'SELECT id, name, brand_name, base_price FROM products WHERE id = $1 AND is_active = true',
             [product_id]
@@ -1236,7 +1166,6 @@ router.post('/orders/create', isAdmin, async (req, res) => {
         const product = productCheck.rows[0];
         console.log('✅ Product found:', product.name);
         
-        // 3. Check agent if provided
         let agentInfo = null;
         let orderStatus = 'pending';
         
@@ -1254,12 +1183,11 @@ router.post('/orders/create', isAdmin, async (req, res) => {
                 });
             }
             agentInfo = agentCheck.rows[0];
-            orderStatus = 'assigned';  // ✅ If agent is assigned, status is 'assigned'
+            orderStatus = 'assigned';
             console.log('✅ Agent found:', agentInfo.business_name);
             console.log('✅ Order will be created with status: assigned');
         }
         
-        // 4. Validate
         if (!quantity || quantity < 1) {
             await client.query('ROLLBACK');
             return res.status(400).json({
@@ -1276,7 +1204,6 @@ router.post('/orders/create', isAdmin, async (req, res) => {
             });
         }
 
-        // 5. Calculate totals
         const unit_price = parseFloat(product.base_price);
         const subtotal = unit_price * quantity;
         const deliveryFee = parseFloat(delivery_fee) || 100;
@@ -1284,14 +1211,12 @@ router.post('/orders/create', isAdmin, async (req, res) => {
         
         console.log('💰 Calculated totals:', { unit_price, subtotal, deliveryFee, total });
         
-        // 6. Generate order number
         const timestamp = Date.now().toString().slice(-8);
         const random = Math.random().toString(36).substring(2, 6).toUpperCase();
         const orderNumber = `ADM${timestamp}${random}`;
         
         console.log('📦 Generated order number:', orderNumber);
         
-        // 7. ✅ Insert order with correct status
         const insertResult = await client.query(
             `INSERT INTO orders (
                 order_number,
@@ -1323,18 +1248,16 @@ router.post('/orders/create', isAdmin, async (req, res) => {
                 total,
                 delivery_address,
                 special_instructions || null,
-                orderStatus,  // ✅ 'pending' or 'assigned'
+                orderStatus,
                 payment_method || 'cash',
                 payment_status || 'pending',
-                agent_id ? new Date() : null  // ✅ Set assigned_at if agent provided
+                agent_id ? new Date() : null
             ]
         );
         
         const order = insertResult.rows[0];
         console.log('✅ Order inserted:', order);
-        console.log('✅ Order status:', order.status);
         
-        // 8. Insert order item if table exists
         try {
             const itemCheck = await client.query(`
                 SELECT EXISTS (
@@ -1363,7 +1286,6 @@ router.post('/orders/create', isAdmin, async (req, res) => {
         await client.query('COMMIT');
         
         console.log('✅ Order created successfully:', order.order_number);
-        console.log('✅ Final status:', order.status);
         
         res.status(201).json({
             success: true,
@@ -1406,7 +1328,6 @@ router.post('/orders/create', isAdmin, async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('❌ Admin create order error:', error);
-        console.error('❌ Error stack:', error.stack);
         
         res.status(500).json({
             success: false,
@@ -1418,9 +1339,6 @@ router.post('/orders/create', isAdmin, async (req, res) => {
     }
 });
 
-// ============================================
-// GET CUSTOMER ORDERS (Admin view)
-// ============================================
 router.get('/orders/customer/:customerId', isAdmin, async (req, res) => {
     try {
         const { customerId } = req.params;
@@ -1451,9 +1369,6 @@ router.get('/orders/customer/:customerId', isAdmin, async (req, res) => {
     }
 });
 
-// ============================================
-// BULK ORDER STATUS UPDATE
-// ============================================
 router.put('/orders/bulk-status', isAdmin, async (req, res) => {
     try {
         const { orderIds, status } = req.body;
@@ -2374,9 +2289,82 @@ router.put('/agents/bulk-approve', isAdmin, async (req, res) => {
     }
 });
 
+// ============================================
+// WALLET / GRACE PERIOD — AGENT OVERSIGHT
+// ============================================
 
+// GET /api/admin/agents/flagged — list grace-period + flagged + blacklisted agents
+router.get('/agents/flagged', async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT a.id, a.business_name, a.mpesa_number, a.id_number,
+                    a.wallet_balance, a.status, a.flagged, a.flag_reason,
+                    a.flagged_at, a.debt_at_flagging,
+                    a.breached_at, a.grace_period_ends_at,
+                    GREATEST(
+                      0,
+                      CEIL(EXTRACT(EPOCH FROM (a.grace_period_ends_at - NOW())) / 86400)
+                    ) AS days_remaining,
+                    u.full_name AS owner_name,
+                    u.phone_number AS owner_phone
+             FROM agents a
+             LEFT JOIN users u ON u.id = a.id
+             WHERE a.flagged = TRUE
+                OR a.status IN ('GRACE_PERIOD', 'FLAGGED_DEBTOR', 'BLACKLISTED')
+             ORDER BY a.flagged_at DESC NULLS LAST, a.breached_at DESC NULLS LAST`
+        );
+        res.json({ agents: r.rows });
+    } catch (err) {
+        console.error('listFlagged error:', err);
+        res.status(500).json({ error: 'Failed to load agents' });
+    }
+});
 
+// POST /api/admin/agent/:id/unblock  { reason }
+router.post('/agent/:id/unblock', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const reason = (req.body.reason || '').trim();
+        if (!reason) return res.status(400).json({ error: 'Reason is required' });
 
+        await walletService.unblock(id, req.user.id, reason);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('unblock error:', err);
+        res.status(500).json({ error: 'Failed to unblock' });
+    }
+});
+
+// POST /api/admin/agent/:id/blacklist  { reason }
+router.post('/agent/:id/blacklist', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const reason = (req.body.reason || 'Manual blacklist').trim();
+
+        const r = await pool.query(
+            `SELECT mpesa_number, id_number, business_name, wallet_balance
+             FROM agents WHERE id = $1`,
+            [id]
+        );
+        if (r.rows.length === 0) return res.status(404).json({ error: 'Agent not found' });
+        const a = r.rows[0];
+
+        await pool.query(
+            `INSERT INTO blacklist_entries
+             (phone, id_number, business_name, debt_amount, reason)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [a.mpesa_number, a.id_number, a.business_name, a.wallet_balance, reason]
+        );
+        await pool.query(
+            `UPDATE agents SET status = 'BLACKLISTED', updated_at = NOW() WHERE id = $1`,
+            [id]
+        );
+        res.json({ success: true });
+    } catch (err) {
+        console.error('blacklist error:', err);
+        res.status(500).json({ error: 'Failed to blacklist' });
+    }
+});
 
 // ================================================================
 // TEMPORARY DEBUG — remove after diagnosing

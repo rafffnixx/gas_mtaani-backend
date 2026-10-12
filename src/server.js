@@ -21,32 +21,21 @@ app.use(helmet({
 // CORS — explicit allowed origins
 // ============================================
 const allowedOrigins = [
-  // Local development
-  'http://localhost:5173',   // Vite dev server
-  'http://localhost:4173',   // Vite preview server
-  'http://localhost:3000',   // CRA / general dev
-  'http://localhost:19006',  // Expo web
-  'http://localhost:8081',   // Metro / RN debugger
-
-  // Production admin panel
+  'http://localhost:5173',
+  'http://localhost:4173',
+  'http://localhost:3000',
+  'http://localhost:19006',
+  'http://localhost:8081',
   'https://admingasmtaani.vercel.app',
 ];
 
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow requests with no Origin header
-    // (mobile apps, curl, server-to-server, Postman)
     if (!origin) return callback(null, true);
-
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-
-    // Allow any Vercel preview URL for this project
+    if (allowedOrigins.includes(origin)) return callback(null, true);
     if (/^https:\/\/admingasmtaani[a-z0-9-]*\.vercel\.app$/.test(origin)) {
       return callback(null, true);
     }
-
     console.warn('🚫 CORS blocked origin:', origin);
     return callback(new Error('Not allowed by CORS'));
   },
@@ -61,11 +50,8 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // ============================================
-// Static assets (product images, logos, etc.)
+// Static assets
 // ============================================
-// Files in backend/assets/ are served at /assets/*
-// e.g. backend/assets/products/progas-13kg.jpg
-//   → https://<host>/assets/products/progas-13kg.jpg
 app.use(
   '/assets',
   express.static(path.join(__dirname, '..', 'assets'), {
@@ -75,8 +61,6 @@ app.use(
   })
 );
 
-// Files uploaded at runtime (agent documents, etc.)
-//   → https://<host>/uploads/agent-documents/...
 app.use(
   '/uploads',
   express.static(path.join(__dirname, '..', 'uploads'), {
@@ -108,7 +92,8 @@ const agentDocumentsRoutes = require('./routes/agentDocuments.routes');
 // ============================================
 // Background services
 // ============================================
-const { startOrderSweeper } = require('./services/orderSweeper');
+const { startOrderSweeper }        = require('./services/orderSweeper');
+const { startGracePeriodScheduler } = require('./services/gracePeriodScheduler');
 
 // Mount admin auth BEFORE /api/admin so /api/admin/auth/* takes priority
 app.use('/api/admin/auth', adminAuthRoutes);
@@ -131,7 +116,7 @@ app.use('/api/agents', agentDocumentsRoutes);   // ← handles GET /documents an
 // Now mount the general agents router
 app.use('/api/agents',    agentRoutes);
 
-// Notification preferences — mounted on its own path, no shadowing risk
+// Notification preferences
 app.use('/api/users/notification-preferences', notificationPreferencesRoutes);
 
 // ⚠️  quoteRoutes must be mounted BEFORE orderRoutes so /api/orders/quote
@@ -192,4 +177,7 @@ app.listen(PORT, () => {
 
   // Start the background sweeper — rescues stuck orders across restarts
   startOrderSweeper();
+
+  // Start the wallet grace-period scheduler — flags/blacklists unpaid agents
+  startGracePeriodScheduler();
 });

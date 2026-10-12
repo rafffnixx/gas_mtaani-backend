@@ -5,6 +5,7 @@ const router = express.Router();
 const { pool } = require('../config/database');
 const { authenticate } = require('../middleware/auth.middleware');
 const { createNotification } = require('../services/notificationService');
+const walletService = require('../services/walletService');
 
 // -----------------------------------------------------------
 // Pesapal v3 — plain HTTP, no SDK
@@ -21,7 +22,6 @@ const IPN_ID = process.env.PESAPAL_IPN_ID;
 const PUBLIC_BASE_URL =
   process.env.PUBLIC_BASE_URL || 'https://gas-mtaani-backend.onrender.com';
 
-// Token cache
 let tokenCache = { token: null, expiresAt: 0 };
 
 async function getPesapalToken() {
@@ -87,11 +87,10 @@ async function getPesapalTransactionStatus(orderTrackingId) {
 }
 
 // -----------------------------------------------------------
-// Shared helper — update payment status + fire notification
+// Shared helper — update payment status + credit agent wallet + notify.
 // Called from both the callback and the IPN handler.
 // -----------------------------------------------------------
 async function applyPaymentOutcome({ trackingId, newStatus, confirmationCode, fallbackRef }) {
-  // 1. Update the order and return the row (so we know customer_id / total_amount)
   let updatedRow = null;
 
   if (newStatus === 'paid') {
@@ -100,10 +99,38 @@ async function applyPaymentOutcome({ trackingId, newStatus, confirmationCode, fa
        SET payment_status = 'paid',
            mpesa_transaction_id = COALESCE($1, mpesa_transaction_id)
        WHERE payment_reference = $2
-       RETURNING id, order_number, customer_id, total_amount`,
+       RETURNING id, order_number, customer_id, agent_id, total_amount`,
       [confirmationCode || null, trackingId]
     );
     updatedRow = r.rows[0] || null;
+
+    // ── Credit the agent's wallet with their net share ──────────
+    if (updatedRow && updatedRow.agent_id) {
+      try {
+        const agentRes = await pool.query(
+          'SELECT commission_rate FROM agents WHERE id = $1',
+          [updatedRow.agent_id]
+        );
+        const rate = Number(agentRes.rows[0]?.commission_rate ?? 10);
+        const total = Number(updatedRow.total_amount);
+        const commission = +(total * (rate / 100)).toFixed(2);
+        const netAmount = +(total - commission).toFixed(2);
+
+        await walletService.credit(
+          updatedRow.agent_id,
+          netAmount,
+          'MPESA_EARNING',
+          updatedRow.id
+        );
+        await walletService.updateBreachState(updatedRow.agent_id);
+
+        console.log(
+          `[payment] credited agent ${updatedRow.agent_id} net ${netAmount} (commission ${commission})`
+        );
+      } catch (walletErr) {
+        console.error('[payment] wallet credit failed:', walletErr.message);
+      }
+    }
   } else if (newStatus === 'failed') {
     const r = await pool.query(
       `UPDATE orders
@@ -122,7 +149,6 @@ async function applyPaymentOutcome({ trackingId, newStatus, confirmationCode, fa
     return null;
   }
 
-  // 2. Fire the notification (best-effort — never throw)
   try {
     if (newStatus === 'paid') {
       await createNotification({

@@ -1,5 +1,7 @@
+// 📁 backend/src/controllers/order.controller.js
 const { pool } = require('../config/database');
 const { v4: uuidv4 } = require('uuid');
+const walletService = require('../services/walletService');
 
 // Generate order number (e.g., GM-2024-001)
 const generateOrderNumber = async () => {
@@ -15,11 +17,10 @@ const generateOrderNumber = async () => {
 const findBestAgent = async (customerLat, customerLng, productId, requestedQuantity = 1) => {
     console.log('🔍 Finding best agent for order...');
     console.log(`📍 Customer location: ${customerLat}, ${customerLng}`);
-    
-    // Query to find the best agent using PostGIS
+
     const query = `
         WITH available_agents AS (
-            SELECT 
+            SELECT
                 a.id,
                 a.business_name,
                 a.current_order_count,
@@ -28,7 +29,7 @@ const findBestAgent = async (customerLat, customerLng, productId, requestedQuant
                 ST_Distance(a.location, ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography) as distance_meters
             FROM agents a
             JOIN agent_inventory ai ON a.id = ai.agent_id
-            WHERE 
+            WHERE
                 a.is_online = true
                 AND a.is_approved = true
                 AND a.is_active = true
@@ -42,7 +43,7 @@ const findBestAgent = async (customerLat, customerLng, productId, requestedQuant
                     a.service_radius
                 )
         )
-        SELECT 
+        SELECT
             id,
             business_name,
             current_order_count,
@@ -51,24 +52,24 @@ const findBestAgent = async (customerLat, customerLng, productId, requestedQuant
             distance_meters,
             ROUND(distance_meters / 1000, 1) as distance_km
         FROM available_agents
-        ORDER BY 
-            current_order_count ASC,  -- Load balancing: agents with least orders first
-            distance_meters ASC       -- Then nearest
+        ORDER BY
+            current_order_count ASC,
+            distance_meters ASC
         LIMIT 1
     `;
-    
+
     const result = await pool.query(query, [
         customerLat,
         customerLng,
         productId,
         requestedQuantity
     ]);
-    
+
     if (result.rows.length === 0) {
         console.log('❌ No available agents found');
         return null;
     }
-    
+
     console.log('✅ Best agent found:', result.rows[0]);
     return result.rows[0];
 };
@@ -82,23 +83,24 @@ const createOrder = async (req, res) => {
             deliveryAddress,
             customerLatitude,
             customerLongitude,
-            specialInstructions
+            specialInstructions,
+            paymentMethod = 'mpesa', // 'cash' | 'mpesa'
         } = req.body;
-        
+
         const customerId = req.user.id;
-        
+
         // Validate product exists and is active
         const productResult = await pool.query(
             'SELECT * FROM products WHERE id = $1 AND is_active = true',
             [productId]
         );
-        
+
         if (productResult.rows.length === 0) {
             return res.status(404).json({ error: 'Product not found or inactive' });
         }
-        
+
         const product = productResult.rows[0];
-        
+
         // Find best agent
         const bestAgent = await findBestAgent(
             customerLatitude,
@@ -106,31 +108,45 @@ const createOrder = async (req, res) => {
             productId,
             quantity
         );
-        
+
         if (!bestAgent) {
-            return res.status(404).json({ 
-                error: 'No available agents within your area. Please try again later.' 
+            return res.status(404).json({
+                error: 'No available agents within your area. Please try again later.'
             });
         }
-        
-        // Calculate delivery fee (e.g., KSH 10 per km, min KSH 50, max KSH 100)
+
+        // ── Block check: refuse order if agent is flagged / grace expired ──
+        try {
+            await walletService.assertAgentCanReceiveOrders(bestAgent.id);
+        } catch (blockErr) {
+            if (blockErr.code === 'AGENT_BLOCKED') {
+                return res.status(403).json({
+                    blocked: true,
+                    flagged: blockErr.flagged || false,
+                    walletBalance: blockErr.walletBalance,
+                    message: blockErr.message,
+                });
+            }
+            throw blockErr;
+        }
+
+        // Calculate delivery fee (KSH 10 per km, min 50, max 100)
         let deliveryFee = bestAgent.distance_km * 10;
-        deliveryFee = Math.max(50, Math.min(100, deliveryFee)); // Clamp between 50-100
-        
+        deliveryFee = Math.max(50, Math.min(100, deliveryFee));
+
         const totalAmount = (product.base_price * quantity) + deliveryFee;
-        
-        // Generate order number
+
         const orderNumber = await generateOrderNumber();
-        
-        // Create the order
         const orderId = uuidv4();
+
         const orderResult = await pool.query(
             `INSERT INTO orders (
                 id, order_number, customer_id, agent_id, product_id,
                 quantity, product_price, delivery_fee, total_amount,
                 customer_latitude, customer_longitude, delivery_address,
-                status, assigned_at, special_instructions
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                status, assigned_at, special_instructions,
+                payment_method, payment_status
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             RETURNING *`,
             [
                 orderId,
@@ -147,19 +163,21 @@ const createOrder = async (req, res) => {
                 deliveryAddress,
                 'assigned',
                 new Date(),
-                specialInstructions || null
+                specialInstructions || null,
+                paymentMethod,
+                paymentMethod === 'cash' ? 'pending' : 'pending',
             ]
         );
-        
+
         // Update agent's current order count
         await pool.query(
             'UPDATE agents SET current_order_count = current_order_count + 1 WHERE id = $1',
             [bestAgent.id]
         );
-        
+
         // Get the full order details
         const fullOrder = await pool.query(
-            `SELECT o.*, p.name as product_name, p.brand_name, 
+            `SELECT o.*, p.name as product_name, p.brand_name,
              a.business_name, a.phone_number
              FROM orders o
              JOIN products p ON o.product_id = p.id
@@ -167,17 +185,17 @@ const createOrder = async (req, res) => {
              WHERE o.id = $1`,
             [orderId]
         );
-        
+
         // Emit real-time notification to the assigned agent
         const io = req.app.get('io');
         io.to(`agent_${bestAgent.id}`).emit('new_order', fullOrder.rows[0]);
-        
+
         res.status(201).json({
             success: true,
             order: fullOrder.rows[0],
             message: `Order placed successfully! Assigned to ${bestAgent.business_name}`
         });
-        
+
     } catch (error) {
         console.error('Create order error:', error);
         res.status(500).json({ error: 'Failed to create order' });
@@ -189,31 +207,29 @@ const acceptOrder = async (req, res) => {
     try {
         const { orderId } = req.params;
         const agentId = req.user.id;
-        
+
         const result = await pool.query(
-            `UPDATE orders 
+            `UPDATE orders
              SET status = 'accepted', accepted_at = CURRENT_TIMESTAMP
              WHERE id = $1 AND agent_id = $2 AND status = 'assigned'
              RETURNING *`,
             [orderId, agentId]
         );
-        
+
         if (result.rows.length === 0) {
             return res.status(404).json({ error: 'Order not found or cannot be accepted' });
         }
-        
-        // Get customer details for notification
+
         const customer = await pool.query(
             'SELECT id FROM users WHERE id = (SELECT customer_id FROM orders WHERE id = $1)',
             [orderId]
         );
-        
-        // Emit to customer
+
         const io = req.app.get('io');
         io.to(`customer_${customer.rows[0].id}`).emit('order_accepted', result.rows[0]);
-        
+
         res.json({ success: true, order: result.rows[0] });
-        
+
     } catch (error) {
         console.error('Accept order error:', error);
         res.status(500).json({ error: 'Failed to accept order' });
@@ -225,30 +241,29 @@ const markDelivered = async (req, res) => {
     try {
         const { orderId } = req.params;
         const agentId = req.user.id;
-        
+
         const result = await pool.query(
-            `UPDATE orders 
+            `UPDATE orders
              SET status = 'delivered', delivered_at = CURRENT_TIMESTAMP
              WHERE id = $1 AND agent_id = $2 AND status = 'accepted'
              RETURNING *`,
             [orderId, agentId]
         );
-        
+
         if (result.rows.length === 0) {
             return res.status(404).json({ error: 'Order not found or cannot be delivered' });
         }
-        
-        // Notify customer to confirm
+
         const customer = await pool.query(
             'SELECT id FROM users WHERE id = (SELECT customer_id FROM orders WHERE id = $1)',
             [orderId]
         );
-        
+
         const io = req.app.get('io');
         io.to(`customer_${customer.rows[0].id}`).emit('delivery_completed', result.rows[0]);
-        
+
         res.json({ success: true, order: result.rows[0] });
-        
+
     } catch (error) {
         console.error('Mark delivered error:', error);
         res.status(500).json({ error: 'Failed to mark as delivered' });
@@ -261,41 +276,71 @@ const confirmDelivery = async (req, res) => {
         const { orderId } = req.params;
         const { rating, feedback } = req.body;
         const customerId = req.user.id;
-        
+
         const result = await pool.query(
-            `UPDATE orders 
+            `UPDATE orders
              SET status = 'confirmed', confirmed_at = CURRENT_TIMESTAMP,
                  customer_rating = $2, customer_feedback = $3,
-                 payment_status = 'paid'
+                 payment_status = CASE
+                    WHEN payment_method = 'cash' THEN 'paid'
+                    ELSE payment_status
+                 END
              WHERE id = $1 AND customer_id = $4 AND status = 'delivered'
              RETURNING *`,
             [orderId, rating, feedback, customerId]
         );
-        
+
         if (result.rows.length === 0) {
             return res.status(404).json({ error: 'Order not found or cannot be confirmed' });
         }
-        
+
         const order = result.rows[0];
-        
-        // Update agent's current order count (decrease)
+
+        // Decrease agent's current order count, bump total deliveries
         await pool.query(
             'UPDATE agents SET current_order_count = current_order_count - 1, total_deliveries = total_deliveries + 1 WHERE id = $1',
             [order.agent_id]
         );
-        
-        // Create agent earnings record
-        const commission = order.total_amount * 0.10; // 10% commission
-        const netAmount = order.total_amount - commission;
-        
+
+        // ── Wallet movements ─────────────────────────────────────────
+        const agentRes = await pool.query(
+            'SELECT commission_rate FROM agents WHERE id = $1',
+            [order.agent_id]
+        );
+        const rate = Number(agentRes.rows[0]?.commission_rate ?? 10);
+        const commission = +(Number(order.total_amount) * (rate / 100)).toFixed(2);
+        const netAmount = +(Number(order.total_amount) - commission).toFixed(2);
+
+        // Keep the earnings report row
         await pool.query(
             `INSERT INTO agent_earnings (agent_id, order_id, amount, commission, net_amount)
              VALUES ($1, $2, $3, $4, $5)`,
             [order.agent_id, orderId, order.total_amount, commission, netAmount]
         );
-        
+
+        if (order.payment_method === 'cash') {
+            // Agent physically collected the cash → they owe us the commission
+            await walletService.debit(
+                order.agent_id,
+                commission,
+                'CASH_COMMISSION',
+                orderId
+            );
+        } else {
+            // M-Pesa order — funds already settled on the platform side
+            await walletService.credit(
+                order.agent_id,
+                netAmount,
+                'MPESA_EARNING',
+                orderId
+            );
+        }
+
+        // Re-evaluate breach / grace state
+        await walletService.updateBreachState(order.agent_id);
+
         res.json({ success: true, order: result.rows[0] });
-        
+
     } catch (error) {
         console.error('Confirm delivery error:', error);
         res.status(500).json({ error: 'Failed to confirm delivery' });

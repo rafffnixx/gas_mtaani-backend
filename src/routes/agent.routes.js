@@ -3,6 +3,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/database');
 const { authenticate, isAgent } = require('../middleware/auth.middleware');
+const walletService = require('../services/walletService');
 
 // ================================================================
 // DASHBOARD
@@ -64,6 +65,99 @@ router.get('/status', authenticate, isAgent, async (req, res) => {
   } catch (error) {
     console.error('Status error:', error.message, error.detail || '');
     res.status(500).json({ error: 'Failed to fetch status', detail: error.message });
+  }
+});
+
+// ================================================================
+// WALLET
+// ================================================================
+router.get('/wallet', authenticate, isAgent, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT wallet_balance, status, flagged, flag_reason,
+              breached_at, grace_period_ends_at, debt_at_flagging,
+              commission_rate, available_balance, total_earnings, withdrawn
+       FROM agents WHERE id = $1`,
+      [req.user.id]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ error: 'Agent not found' });
+
+    const a = r.rows[0];
+    let daysRemaining = null;
+    if (a.grace_period_ends_at) {
+      const ms = new Date(a.grace_period_ends_at) - new Date();
+      daysRemaining = Math.max(0, Math.ceil(ms / (1000 * 60 * 60 * 24)));
+    }
+
+    res.json({
+      walletBalance: Number(a.wallet_balance || 0),
+      status: a.status || 'ACTIVE',
+      flagged: a.flagged || false,
+      flagReason: a.flag_reason,
+      debtAtFlagging: a.debt_at_flagging != null ? Number(a.debt_at_flagging) : null,
+      breachedAt: a.breached_at,
+      gracePeriodEndsAt: a.grace_period_ends_at,
+      daysRemaining,
+      commissionRate: Number(a.commission_rate || 10),
+      availableBalance: Number(a.available_balance || 0),
+      totalEarnings: Number(a.total_earnings || 0),
+      withdrawn: Number(a.withdrawn || 0),
+    });
+  } catch (err) {
+    console.error('getWallet error:', err);
+    res.status(500).json({ error: 'Failed to load wallet' });
+  }
+});
+
+router.get('/wallet/ledger', authenticate, isAgent, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const r = await pool.query(
+      `SELECT id, type, amount, balance_after, order_id, created_at
+       FROM wallet_ledger
+       WHERE agent_id = $1
+       ORDER BY created_at DESC
+       LIMIT $2`,
+      [req.user.id, limit]
+    );
+    res.json({ entries: r.rows });
+  } catch (err) {
+    console.error('getLedger error:', err);
+    res.status(500).json({ error: 'Failed to load ledger' });
+  }
+});
+
+// Settle — for cash agents paying commission back to the platform.
+// Returns instructions; the actual credit happens via the M-Pesa C2B webhook.
+router.post('/settle', authenticate, isAgent, async (req, res) => {
+  try {
+    const amount = Number(req.body.amount);
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ error: 'Amount must be positive' });
+    }
+
+    const r = await pool.query(
+      'SELECT wallet_balance FROM agents WHERE id = $1',
+      [req.user.id]
+    );
+    const bal = Number(r.rows[0]?.wallet_balance || 0);
+    if (bal >= 0) {
+      return res.status(400).json({ error: 'Nothing to settle — balance is positive' });
+    }
+
+    const payTo = process.env.ADMIN_MPESA_NUMBER || '254700000000';
+    const reference = `AGT-${req.user.id.slice(0, 8)}-SETTLE`;
+
+    res.json({
+      payTo,
+      amount: Math.min(amount, Math.abs(bal)),
+      reference,
+      currentBalance: bal,
+      message: 'Send the amount via M-Pesa, then wait for confirmation.',
+    });
+  } catch (err) {
+    console.error('settle error:', err);
+    res.status(500).json({ error: 'Failed to create settlement' });
   }
 });
 
@@ -355,7 +449,9 @@ router.get('/earnings', authenticate, isAgent, async (req, res) => {
     );
 
     const balances = await pool.query(
-      `SELECT total_earnings, available_balance FROM agents WHERE id = $1`,
+      `SELECT total_earnings, available_balance, wallet_balance, status,
+              flagged, grace_period_ends_at
+       FROM agents WHERE id = $1`,
       [req.user.id]
     );
 
@@ -368,6 +464,10 @@ router.get('/earnings', authenticate, isAgent, async (req, res) => {
       this_month: Number(summary.this_month || 0),
       total: Number(b.total_earnings || summary.total || 0),
       available_balance: Number(b.available_balance || 0),
+      wallet_balance: Number(b.wallet_balance || 0),
+      status: b.status || 'ACTIVE',
+      flagged: b.flagged || false,
+      grace_period_ends_at: b.grace_period_ends_at || null,
       transactions: [],
     });
   } catch (error) {
@@ -377,11 +477,8 @@ router.get('/earnings', authenticate, isAgent, async (req, res) => {
 });
 
 // ================================================================
-// ORDERS (reads only — writes live in order.routes.js)
+// ORDERS
 // ================================================================
-
-// New / unassigned orders — pending + assigned for this agent
-// NOTE: customer_name / customer_phone are hidden from agents.
 router.get('/orders/new', authenticate, isAgent, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -429,8 +526,6 @@ router.get('/orders/new', authenticate, isAgent, async (req, res) => {
   }
 });
 
-// This agent's orders (all statuses)
-// NOTE: customer_name / customer_phone are hidden from agents.
 router.get('/orders', authenticate, isAgent, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -485,7 +580,7 @@ router.get('/payout-details', authenticate, isAgent, async (req, res) => {
       `SELECT mpesa_number, mpesa_name,
               bank_name, bank_account_name, bank_account_no, bank_branch,
               preferred_payout,
-              total_earnings, available_balance
+              total_earnings, available_balance, wallet_balance, status, flagged
        FROM agents WHERE id = $1`,
       [req.user.id]
     );
@@ -545,13 +640,9 @@ router.put('/payout-details', authenticate, isAgent, async (req, res) => {
   }
 });
 
-
-
-// =====================================================
-// GET /api/agents/reviews
-// Lists all customer ratings left on this agent's orders.
-// Customer identity is anonymized — only initials are returned.
-// =====================================================
+// ================================================================
+// REVIEWS
+// ================================================================
 router.get('/reviews', authenticate, isAgent, async (req, res) => {
   try {
     const agentId = req.user.id;
@@ -614,10 +705,8 @@ router.get('/reviews', authenticate, isAgent, async (req, res) => {
   }
 });
 
-
-
 // ================================================================
-// WITHDRAWALS
+// WITHDRAWALS (now based on wallet_balance)
 // ================================================================
 router.post('/withdraw', authenticate, isAgent, async (req, res) => {
   const client = await pool.connect();
@@ -633,7 +722,7 @@ router.post('/withdraw', authenticate, isAgent, async (req, res) => {
     }
 
     const { rows } = await client.query(
-      `SELECT available_balance,
+      `SELECT wallet_balance, status, flagged,
               preferred_payout,
               mpesa_number, mpesa_name,
               bank_name, bank_account_name, bank_account_no
@@ -645,8 +734,33 @@ router.post('/withdraw', authenticate, isAgent, async (req, res) => {
       return res.status(404).json({ error: 'Agent not found' });
     }
     const agent = rows[0];
-    const chosen = method || agent.preferred_payout || 'mpesa';
 
+    if (agent.flagged) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({
+        error: 'Account blocked for unpaid commission.',
+        code: 'agent_blocked',
+      });
+    }
+
+    const bal = Number(agent.wallet_balance || 0);
+    if (bal <= 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: 'Nothing to withdraw — settle your commission first.',
+        code: 'wallet_negative',
+        walletBalance: bal,
+      });
+    }
+    if (amt > bal) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: `Insufficient balance. Available: KES ${bal.toLocaleString()}`,
+        code: 'insufficient_balance',
+      });
+    }
+
+    const chosen = method || agent.preferred_payout || 'mpesa';
     if (chosen === 'mpesa' && !agent.mpesa_number) {
       await client.query('ROLLBACK');
       return res.status(400).json({
@@ -662,14 +776,6 @@ router.post('/withdraw', authenticate, isAgent, async (req, res) => {
       });
     }
 
-    if (amt > Number(agent.available_balance || 0)) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({
-        error: `Insufficient balance. Available: KES ${Number(agent.available_balance || 0).toLocaleString()}`,
-        code: 'insufficient_balance',
-      });
-    }
-
     const dest = chosen === 'mpesa'
       ? { name: agent.mpesa_name, number: agent.mpesa_number, bank: null }
       : { name: agent.bank_account_name, number: agent.bank_account_no, bank: agent.bank_name };
@@ -682,15 +788,12 @@ router.post('/withdraw', authenticate, isAgent, async (req, res) => {
       [req.user.id, amt, chosen, dest.name, dest.number, dest.bank]
     );
 
-    await client.query(
-      `UPDATE agents
-       SET available_balance = available_balance - $1,
-           updated_at        = NOW()
-       WHERE id = $2`,
-      [amt, req.user.id]
-    );
-
     await client.query('COMMIT');
+
+    // Record wallet movement + re-evaluate breach state
+    await walletService.debit(req.user.id, amt, 'WITHDRAWAL');
+    await walletService.updateBreachState(req.user.id);
+
     res.json({ success: true, withdrawal: w.rows[0] });
   } catch (error) {
     await client.query('ROLLBACK');

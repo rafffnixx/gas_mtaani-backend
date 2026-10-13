@@ -128,38 +128,87 @@ router.get('/wallet/ledger', authenticate, isAgent, async (req, res) => {
 });
 
 // Settle — for cash agents paying commission back to the platform.
-// Returns instructions; the actual credit happens via the M-Pesa C2B webhook.
-router.post('/settle', authenticate, isAgent, async (req, res) => {
+// ================================================================
+// SETTLE COMMISSION VIA PESAPAL
+// ================================================================
+const settlementService = require('../services/settlementService');
+
+router.post('/settle/initiate', authenticate, isAgent, async (req, res) => {
   try {
     const amount = Number(req.body.amount);
-    if (!amount || amount <= 0) {
-      return res.status(400).json({ error: 'Amount must be positive' });
-    }
-
-    const r = await pool.query(
-      'SELECT wallet_balance FROM agents WHERE id = $1',
-      [req.user.id]
-    );
-    const bal = Number(r.rows[0]?.wallet_balance || 0);
-    if (bal >= 0) {
-      return res.status(400).json({ error: 'Nothing to settle — balance is positive' });
-    }
-
-    const payTo = process.env.ADMIN_MPESA_NUMBER || '254700000000';
-    const reference = `AGT-${req.user.id.slice(0, 8)}-SETTLE`;
-
+    const result = await settlementService.initiate(req.user.id, amount);
     res.json({
-      payTo,
-      amount: Math.min(amount, Math.abs(bal)),
-      reference,
-      currentBalance: bal,
-      message: 'Send the amount via M-Pesa, then wait for confirmation.',
+      success: true,
+      redirectUrl: result.redirectUrl,
+      reference: result.reference,
+      amount: result.amount,
+      settlementId: result.settlementId,
     });
   } catch (err) {
-    console.error('settle error:', err);
-    res.status(500).json({ error: 'Failed to create settlement' });
+    if (err.code === 'NOTHING_TO_SETTLE') {
+      return res.status(400).json({ error: err.message });
+    }
+    console.error('settle/initiate error:', err);
+    res.status(500).json({ error: 'Failed to initiate settlement' });
   }
 });
+
+router.get('/settle/callback', async (req, res) => {
+  try {
+    const { OrderTrackingId, OrderMerchantReference } = req.query;
+    if (OrderTrackingId) {
+      try {
+        await settlementService.applyOutcome({ trackingId: OrderTrackingId });
+      } catch (verifyErr) {
+        console.warn(
+          'settle callback verify failed:',
+          verifyErr?.details || verifyErr.message
+        );
+      }
+    }
+    const deepLink = `gasmtaani://settle-result?trackingId=${
+      OrderTrackingId || ''
+    }&reference=${OrderMerchantReference || ''}`;
+    res.redirect(deepLink);
+  } catch (err) {
+    console.error('settle/callback error:', err);
+    res.status(500).send('Settlement callback failed');
+  }
+});
+
+async function handleSettleIPN(req, res) {
+  try {
+    const src = { ...req.query, ...req.body };
+    const OrderTrackingId =
+      src.OrderTrackingId || src.order_tracking_id || src.orderTrackingId;
+    const OrderMerchantReference =
+      src.OrderMerchantReference ||
+      src.order_merchant_reference ||
+      src.orderMerchantReference;
+
+    if (!OrderTrackingId) {
+      return res
+        .status(400)
+        .json({ error: 'Missing OrderTrackingId in settlement IPN' });
+    }
+
+    await settlementService.applyOutcome({ trackingId: OrderTrackingId });
+
+    res.status(200).json({
+      orderNotificationType:
+        src.OrderNotificationType || src.order_notification_type || 'IPNCHANGE',
+      orderTrackingId: OrderTrackingId,
+      orderMerchantReference: OrderMerchantReference,
+      status: 200,
+    });
+  } catch (err) {
+    console.error('settle IPN error:', err?.details || err);
+    res.status(500).json({ error: 'Settlement IPN processing failed' });
+  }
+}
+
+router.get('/settle/ipn', handleSettleIPN);
+router.post('/settle/ipn', handleSettleIPN);
 
 // ================================================================
 // BUSINESS PROFILE

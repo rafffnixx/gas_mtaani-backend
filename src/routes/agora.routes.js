@@ -11,32 +11,21 @@ const {
   APP_ID,
 } = require('../services/agoraService');
 
-// =====================================================
 // GET APP ID
-// Client fetches this once at startup.
-// App ID is public — safe to expose.
-// =====================================================
 router.get('/app-id', (req, res) => {
-  if (!APP_ID) {
-    return res.status(500).json({ error: 'Agora not configured' });
-  }
+  if (!APP_ID) return res.status(500).json({ error: 'Agora not configured' });
   res.json({ app_id: APP_ID });
 });
 
 // =====================================================
 // ORDER CALL TOKEN
-// Both customer and agent call this to join the same channel.
-// Verifies the caller is a party to the order.
-// Does NOT expose phone numbers.
 // =====================================================
 router.post('/order-call/token', authenticate, async (req, res) => {
   try {
     const userId = req.user.id;
     const { order_id } = req.body || {};
 
-    if (!order_id) {
-      return res.status(400).json({ error: 'order_id is required' });
-    }
+    if (!order_id) return res.status(400).json({ error: 'order_id is required' });
 
     const orderRes = await pool.query(
       `SELECT id, customer_id, agent_id, order_number
@@ -44,9 +33,7 @@ router.post('/order-call/token', authenticate, async (req, res) => {
       [order_id]
     );
 
-    if (orderRes.rows.length === 0) {
-      return res.status(404).json({ error: 'Order not found' });
-    }
+    if (orderRes.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
 
     const order = orderRes.rows[0];
     const isCustomer = order.customer_id === userId;
@@ -56,14 +43,33 @@ router.post('/order-call/token', authenticate, async (req, res) => {
       return res.status(403).json({ error: 'You are not a party to this order' });
     }
 
+    const calleeId = isCustomer ? order.agent_id : order.customer_id;
+    
+    // ── CHECK CALLEE STATUS ──
+    let isCalleeOnline = false;
+    let statusText = 'Calling...';
+
+    if (calleeId) {
+      const calleeRes = await pool.query(
+        `SELECT is_online FROM agents WHERE id = $1`,
+        [calleeId]
+      );
+      if (calleeRes.rows.length > 0) {
+        isCalleeOnline = calleeRes.rows[0].is_online;
+        statusText = isCalleeOnline ? 'Ringing...' : 'Calling...';
+      }
+    }
+
     const channelName = orderChannelName(order_id);
     const uid = Math.floor(Math.random() * 1000000) + 1000;
     const token = generateToken(channelName, uid, 3600);
 
-    await pool.query(
-      `INSERT INTO call_sessions (order_id, caller_id, channel_name, status)
-       VALUES ($1, $2, $3, 'ringing')`,
-      [order_id, userId, channelName]
+    // ── LOG THE CALL ──
+    const logRes = await pool.query(
+      `INSERT INTO call_logs (caller_id, callee_id, order_id, status)
+       VALUES ($1, $2, $3, 'initiated')
+       RETURNING id`,
+      [userId, calleeId, order_id]
     );
 
     res.json({
@@ -74,6 +80,9 @@ router.post('/order-call/token', authenticate, async (req, res) => {
       uid,
       expires_in: 3600,
       order_number: order.order_number,
+      status_text: statusText,
+      is_callee_online: isCalleeOnline,
+      call_log_id: logRes.rows[0].id 
     });
   } catch (error) {
     console.error('Order call token error:', error);
@@ -83,8 +92,6 @@ router.post('/order-call/token', authenticate, async (req, res) => {
 
 // =====================================================
 // RING THE OTHER PARTY ON AN ORDER
-// Caller hits this after getting their own token.
-// Sends a push to the counterparty with the channel details.
 // =====================================================
 router.post('/order-call/:orderId/ring', authenticate, async (req, res) => {
   try {
@@ -101,9 +108,7 @@ router.post('/order-call/:orderId/ring', authenticate, async (req, res) => {
       [orderId]
     );
 
-    if (orderRes.rows.length === 0) {
-      return res.status(404).json({ error: 'Order not found' });
-    }
+    if (orderRes.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
 
     const order = orderRes.rows[0];
     const isCustomer = order.customer_id === userId;
@@ -114,9 +119,7 @@ router.post('/order-call/:orderId/ring', authenticate, async (req, res) => {
     }
 
     const calleeId = isCustomer ? order.agent_id : order.customer_id;
-    if (!calleeId) {
-      return res.status(400).json({ error: 'Order has no counterparty yet' });
-    }
+    if (!calleeId) return res.status(400).json({ error: 'Order has no counterparty yet' });
 
     const callerName = isCustomer ? order.customer_name : order.agent_name;
 
@@ -138,9 +141,56 @@ router.post('/order-call/:orderId/ring', authenticate, async (req, res) => {
 });
 
 // =====================================================
-// SUPPORT CALL TOKEN
-// Customer or agent requests support. Creates a support_calls row.
-// Admin web polls for 'ringing' calls and joins the channel.
+// END CALL (Update duration)
+// =====================================================
+router.post('/call/:logId/end', authenticate, async (req, res) => {
+  try {
+    const { logId } = req.params;
+    const { duration_seconds } = req.body;
+
+    await pool.query(
+      `UPDATE call_logs
+       SET status = 'ended', duration_seconds = $1, ended_at = NOW()
+       WHERE id = $2`,
+      [duration_seconds || 0, logId]
+    );
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('End call error:', error);
+    res.status(500).json({ error: 'Failed to end call' });
+  }
+});
+
+// =====================================================
+// CALL HISTORY
+// =====================================================
+router.get('/history', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const result = await pool.query(
+      `SELECT c.*, 
+              o.order_number,
+              u1.full_name AS caller_name,
+              u2.full_name AS callee_name
+       FROM call_logs c
+       LEFT JOIN orders o ON c.order_id = o.id
+       LEFT JOIN users u1 ON c.caller_id = u1.id
+       LEFT JOIN users u2 ON c.callee_id = u2.id
+       WHERE c.caller_id = $1 OR c.callee_id = $1
+       ORDER BY c.created_at DESC
+       LIMIT 50`,
+      [userId]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Call history error:', error);
+    res.status(500).json({ error: 'Failed to fetch call history' });
+  }
+});
+
+// =====================================================
+// SUPPORT CALLS (Keep existing logic)
 // =====================================================
 router.post('/support-call/token', authenticate, async (req, res) => {
   try {
@@ -183,14 +233,9 @@ router.post('/support-call/token', authenticate, async (req, res) => {
   }
 });
 
-// =====================================================
-// PENDING SUPPORT CALLS (Admin only)
-// =====================================================
 router.get('/support-calls/pending', authenticate, async (req, res) => {
   try {
-    if (req.user.user_type !== 'admin') {
-      return res.status(403).json({ error: 'Admin only' });
-    }
+    if (req.user.user_type !== 'admin') return res.status(403).json({ error: 'Admin only' });
 
     const result = await pool.query(
       `SELECT sc.id, sc.caller_id, sc.caller_type, sc.channel_name,
@@ -201,22 +246,15 @@ router.get('/support-calls/pending', authenticate, async (req, res) => {
        WHERE sc.status = 'ringing'
        ORDER BY sc.created_at ASC`
     );
-
     res.json(result.rows);
   } catch (error) {
-    console.error('Pending support calls error:', error);
     res.status(500).json({ error: 'Failed to fetch pending calls' });
   }
 });
 
-// =====================================================
-// ANSWER SUPPORT CALL (Admin only)
-// =====================================================
 router.post('/support-calls/:callId/answer', authenticate, async (req, res) => {
   try {
-    if (req.user.user_type !== 'admin') {
-      return res.status(403).json({ error: 'Admin only' });
-    }
+    if (req.user.user_type !== 'admin') return res.status(403).json({ error: 'Admin only' });
 
     const { callId } = req.params;
     const adminId = req.user.id;
@@ -226,14 +264,10 @@ router.post('/support-calls/:callId/answer', authenticate, async (req, res) => {
       [callId]
     );
 
-    if (callRes.rows.length === 0) {
-      return res.status(404).json({ error: 'Support call not found' });
-    }
+    if (callRes.rows.length === 0) return res.status(404).json({ error: 'Support call not found' });
 
     const call = callRes.rows[0];
-    if (call.status !== 'ringing') {
-      return res.status(400).json({ error: `Call is already ${call.status}` });
-    }
+    if (call.status !== 'ringing') return res.status(400).json({ error: `Call is already ${call.status}` });
 
     const uid = Math.floor(Math.random() * 1000000) + 1000;
     const token = generateToken(call.channel_name, uid, 3600);
@@ -254,14 +288,10 @@ router.post('/support-calls/:callId/answer', authenticate, async (req, res) => {
       expires_in: 3600,
     });
   } catch (error) {
-    console.error('Answer support call error:', error);
     res.status(500).json({ error: 'Failed to answer support call' });
   }
 });
 
-// =====================================================
-// END SUPPORT CALL
-// =====================================================
 router.post('/support-calls/:callId/end', authenticate, async (req, res) => {
   try {
     const { callId } = req.params;
@@ -275,7 +305,6 @@ router.post('/support-calls/:callId/end', authenticate, async (req, res) => {
 
     res.json({ success: true });
   } catch (error) {
-    console.error('End support call error:', error);
     res.status(500).json({ error: 'Failed to end call' });
   }
 });

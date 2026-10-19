@@ -76,6 +76,7 @@ app.use(
 const authRoutes          = require('./routes/auth.routes');
 const adminAuthRoutes     = require('./routes/adminAuth.routes');
 const customerRoutes      = require('./routes/customer.routes');
+const customerWalletRoutes = require('./routes/customerWallet.routes'); // <-- NEW
 const productRoutes       = require('./routes/product.routes');
 const agentRoutes         = require('./routes/agent.routes');
 const orderRoutes         = require('./routes/order.routes');
@@ -100,7 +101,11 @@ app.use('/api/admin/auth', adminAuthRoutes);
 
 // Existing routes
 app.use('/api/auth',      authRoutes);
+
+// ⚠️ Mount the specific wallet routes BEFORE the general customer routes
+app.use('/api/customers/wallet', customerWalletRoutes); // <-- NEW
 app.use('/api/customers', customerRoutes);
+
 app.use('/api/products',  productRoutes);
 app.use('/api/chat',      chatRoutes);
 app.use('/api/notifications', notificationsRoutes);
@@ -165,6 +170,7 @@ app.listen(PORT, () => {
   console.log(`📋 Health check: http://localhost:${PORT}/api/health`);
   console.log(`🔑 Admin auth:   http://localhost:${PORT}/api/admin/auth`);
   console.log(`👤 Customers:    http://localhost:${PORT}/api/customers`);
+  console.log(`💳 Cust Wallet:  http://localhost:${PORT}/api/customers/wallet`);
   console.log(`🔑 Admin routes: http://localhost:${PORT}/api/admin`);
   console.log(`🖼  Assets:      http://localhost:${PORT}/assets/*`);
   console.log(`📤 Uploads:      http://localhost:${PORT}/uploads/*`);

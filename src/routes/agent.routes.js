@@ -109,14 +109,24 @@ router.get('/wallet', authenticate, isAgent, async (req, res) => {
   }
 });
 
+// ── UPDATED: JOIN WITH ORDERS ──
 router.get('/wallet/ledger', authenticate, isAgent, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit) || 50, 200);
     const r = await pool.query(
-      `SELECT id, type, amount, balance_after, order_id, created_at
-       FROM wallet_ledger
-       WHERE agent_id = $1
-       ORDER BY created_at DESC
+      `SELECT 
+         wl.id, 
+         wl.type, 
+         wl.amount, 
+         wl.balance_after, 
+         wl.order_id, 
+         wl.created_at,
+         o.order_number,
+         o.total_amount AS order_total
+       FROM wallet_ledger wl
+       LEFT JOIN orders o ON o.id = wl.order_id
+       WHERE wl.agent_id = $1
+       ORDER BY wl.created_at DESC
        LIMIT $2`,
       [req.user.id, limit]
     );

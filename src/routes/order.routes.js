@@ -1120,7 +1120,8 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
     const { reason } = req.body;
 
     const orderRes = await client.query(
-      `SELECT id, product_id, quantity, status, agent_id, customer_id
+      `SELECT id, product_id, quantity, status, agent_id, customer_id, 
+              payment_status, payment_method, total_amount
        FROM orders WHERE id = $1 FOR UPDATE`,
       [orderId]
     );
@@ -1134,9 +1135,9 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'Not your order' });
     }
-    if (
-      !['pending', 'searching', 'assigned', 'accepted'].includes(order.status)
-    ) {
+    
+    // Only allow cancel if not delivered yet
+    if (!['pending', 'searching', 'assigned', 'accepted'].includes(order.status)) {
       await client.query('ROLLBACK');
       return res.status(400).json({
         error: 'Order cannot be cancelled in its current state',
@@ -1144,6 +1145,7 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
       });
     }
 
+    // Return stock to agent if assigned
     if (order.agent_id && ['assigned', 'accepted'].includes(order.status)) {
       const itemsRes = await client.query(
         `SELECT product_id, quantity FROM order_items WHERE order_id = $1`,
@@ -1151,9 +1153,7 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
       );
       let lineItems = itemsRes.rows;
       if (lineItems.length === 0) {
-        lineItems = [
-          { product_id: order.product_id, quantity: order.quantity },
-        ];
+        lineItems = [{ product_id: order.product_id, quantity: order.quantity }];
       }
 
       for (const it of lineItems) {
@@ -1176,6 +1176,38 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
       );
     }
 
+    // ── REFUND LOGIC ──
+    let refundAmount = 0;
+    if (order.payment_status === 'paid') {
+      // If they paid via M-Pesa/Pesapal, credit their wallet
+      if (order.payment_method === 'pesapal') {
+        refundAmount = Number(order.total_amount);
+      } 
+      // If they paid via Wallet, refund it to the wallet
+      else if (order.payment_method === 'wallet') {
+        refundAmount = Number(order.total_amount);
+      }
+
+      if (refundAmount > 0) {
+        // We update the order first to 'cancelled'
+        await client.query(
+          `UPDATE orders SET payment_status = 'refunded' WHERE id = $1`,
+          [orderId]
+        );
+        
+        // Then credit their wallet manually within this transaction
+        const userRes = await client.query('SELECT wallet_balance FROM users WHERE id = $1 FOR UPDATE', [customerId]);
+        const newBal = Number(userRes.rows[0].wallet_balance) + refundAmount;
+        
+        await client.query('UPDATE users SET wallet_balance = $1 WHERE id = $2', [newBal, customerId]);
+        await client.query(
+          `INSERT INTO customer_wallet_ledger (customer_id, order_id, type, amount, balance_after)
+           VALUES ($1, $2, 'REFUND', $3, $4)`,
+          [customerId, orderId, refundAmount, newBal]
+        );
+      }
+    }
+
     const result = await client.query(
       `UPDATE orders
        SET status = 'cancelled',
@@ -1188,15 +1220,16 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
     );
 
     await client.query('COMMIT');
-
+    
     clearAllTimers(orderId);
-
-    await notifyOrderEvent(result.rows[0], 'cancelled');
 
     res.json({
       success: true,
-      message: 'Order cancelled',
+      message: refundAmount > 0 
+        ? `Order cancelled. KES ${refundAmount} refunded to your wallet.` 
+        : 'Order cancelled',
       order: result.rows[0],
+      refunded: refundAmount
     });
   } catch (error) {
     await client.query('ROLLBACK');

@@ -105,23 +105,19 @@ router.post('/register', async (req, res) => {
 
     const newUser = result.rows[0];
 
-    if (user_type === 'agent') {
-      const tableCheck = await client.query(`
-        SELECT EXISTS (
-          SELECT FROM information_schema.tables
-          WHERE table_name = 'agent_profiles'
-        )
-      `);
+    // ── Create the Agent Profile if registering as an agent ──
+    if (newUser.user_type === 'agent') {
+      // Generate a unique partner code (e.g., WTG-AB12CD)
+      const partnerCode = `WTG-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
 
-      if (tableCheck.rows[0].exists) {
-        await client.query(
-          `INSERT INTO agent_profiles (
-              user_id, business_name, is_approved, is_active, created_at, updated_at
-           ) VALUES ($1, $2, false, true, NOW(), NOW())`,
-          [newUser.id, full_name + ' - Agent']
-        );
-        console.log('✅ Agent profile created for:', full_name);
-      }
+      await client.query(
+        `INSERT INTO agents (
+            id, business_name, partner_code, is_approved, is_active, 
+            is_online, service_radius, commission_rate, wallet_balance, status
+         ) VALUES ($1, $2, $3, false, true, false, 5000, 10.00, 0, 'ACTIVE')`,
+        [newUser.id, full_name, partnerCode]
+      );
+      console.log('✅ Agent profile created for:', full_name, '| Code:', partnerCode);
     }
 
     await client.query('COMMIT');

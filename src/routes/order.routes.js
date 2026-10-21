@@ -1107,6 +1107,38 @@ router.put(
   }
 );
 
+// Agent sends their live location while delivering
+router.put('/:orderId/location', authenticate, isAgent, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { lat, lng } = req.body;
+    const agentId = req.user.id;
+
+    if (lat == null || lng == null) {
+      return res.status(400).json({ error: 'lat and lng are required' });
+    }
+
+    const result = await pool.query(
+      `UPDATE orders
+       SET agent_current_lat = $1,
+           agent_current_lng = $2,
+           updated_at = NOW()
+       WHERE id = $3 AND agent_id = $4
+       RETURNING id`,
+      [lat, lng, orderId, agentId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Order not found or not yours' });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Location ping error:', err);
+    res.status(500).json({ error: 'Failed to update location' });
+  }
+});
+
 // =====================================================
 // CANCEL ORDER (Customer)
 // =====================================================

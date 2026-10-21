@@ -2149,6 +2149,38 @@ router.delete('/trash/permanent/:type/:id', isAdmin, async (req, res) => {
     }
 });
 
+
+
+// ============================================
+// LIVE AGENT TRACKING
+// ============================================
+router.get('/orders/live-tracking', isAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        o.id AS order_id,
+        o.order_number,
+        o.status,
+        o.agent_current_lat AS agent_lat,
+        o.agent_current_lng AS agent_lng,
+        o.customer_latitude AS customer_lat,
+        o.customer_longitude AS customer_lng,
+        a.business_name AS agent_name,
+        u.phone_number AS agent_phone
+      FROM orders o
+      JOIN agents a ON a.id = o.agent_id
+      LEFT JOIN users u ON u.id = a.id
+      WHERE o.status IN ('accepted', 'out_for_delivery')
+      ORDER BY o.updated_at DESC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Live tracking error:', err);
+    res.status(500).json({ error: 'Failed to fetch live orders' });
+  }
+});
+
+
 // ============================================
 // EXPORTS
 // ============================================

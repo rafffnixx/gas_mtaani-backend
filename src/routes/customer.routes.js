@@ -116,15 +116,29 @@ router.post('/addresses/request-pin', async (req, res) => {
 router.post('/addresses', async (req, res) => {
   const client = await pool.connect();
   try {
+    // Debug (remove after confirming)
+    console.log('[POST /addresses] user:', req.user?.id, 'body keys:', Object.keys(req.body || {}));
+
     await client.query('BEGIN');
-    const userId = req.user.id;
+
+    // Accept either req.user.id or req.user.userId
+    const userId = req.user?.id || req.user?.userId || req.user?.user_id;
+    if (!userId) {
+      await client.query('ROLLBACK');
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
     const {
-      id, label, address, latitude, longitude, location_source,
+      id, label,
+      address,                    // primary
+      free_text_address,          // mobile alt
+      latitude, longitude, location_source,
       county_code, constituency_code, ward_code, area_name, landmark,
       instructions, is_default,
-    } = req.body;
+    } = req.body || {};
 
-    if (!address || !String(address).trim()) {
+    const finalAddress = address || free_text_address;
+    if (!finalAddress || !String(finalAddress).trim()) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'address is required' });
     }
@@ -136,7 +150,8 @@ router.post('/addresses', async (req, res) => {
       );
     }
 
-    const finalId = id || `addr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const finalId =
+      id || `addr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
     const { rows } = await client.query(
       `INSERT INTO customer_addresses
@@ -160,7 +175,7 @@ router.post('/addresses', async (req, res) => {
          updated_at         = CURRENT_TIMESTAMP
        RETURNING *`,
       [
-        finalId, userId, label || 'Address', address,
+        finalId, userId, label || 'Address', finalAddress,
         latitude ?? null, longitude ?? null, location_source ?? null,
         county_code ?? null, constituency_code ?? null, ward_code ?? null,
         area_name ?? null, landmark ?? null, instructions ?? null,
@@ -169,11 +184,15 @@ router.post('/addresses', async (req, res) => {
     );
 
     await client.query('COMMIT');
-    res.json(rows[0]);
+    res.status(201).json(rows[0]);
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error('POST /customers/addresses error:', err);
-    res.status(500).json({ error: 'Failed to save address' });
+    console.error('POST /customers/addresses error:', err.message, err.detail || '');
+    res.status(500).json({
+      error: 'Failed to save address',
+      detail: err.message,
+      db_detail: err.detail || null,
+    });
   } finally {
     client.release();
   }

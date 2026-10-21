@@ -2343,6 +2343,36 @@ router.get('/exports/customers', isAdmin, async (req, res) => {
     }
 });
 
+// GET all ringing + answered calls (for the call page)
+router.get('/support-calls/active', isAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT 
+         sc.id,
+         sc.caller_id,
+         sc.caller_type,
+         sc.channel_name,
+         sc.status,
+         sc.created_at,
+         sc.answered_at,
+         u.full_name AS caller_name,
+         u.phone_number AS caller_phone
+       FROM support_calls sc
+       LEFT JOIN users u ON u.id = sc.caller_id
+       WHERE sc.status IN ('ringing', 'answered')
+       ORDER BY 
+         CASE WHEN sc.status = 'ringing' THEN 0 ELSE 1 END,
+         sc.created_at DESC
+       LIMIT 20`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Active support calls error:', err);
+    res.status(500).json({ error: 'Failed to fetch active calls' });
+  }
+});
+
+
 router.get('/exports/products', isAdmin, async (req, res) => {
     try {
         const result = await pool.query(`

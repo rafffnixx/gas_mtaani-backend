@@ -5,6 +5,7 @@ const router = express.Router();
 const { pool } = require('../config/database');
 const { authenticate, isAdmin } = require('../middleware/auth.middleware');
 const walletService = require('../services/walletService');
+const { generateToken, APP_ID } = require('../services/agoraService');
 
 // Apply JWT + admin role check to every route in this file
 router.use(authenticate);
@@ -18,8 +19,8 @@ router.get('/dashboard', async (req, res) => {
         const stats = await pool.query(`
             SELECT 
                 (SELECT COUNT(*) FROM users WHERE user_type = 'customer') as total_customers,
-                (SELECT COUNT(*) FROM agent_profiles WHERE is_approved = true) as total_agents,
-                (SELECT COUNT(*) FROM agent_profiles WHERE is_approved = false) as pending_agents,
+                (SELECT COUNT(*) FROM agents WHERE is_approved = true) as total_agents,
+                (SELECT COUNT(*) FROM agents WHERE is_approved = false) as pending_agents,
                 (SELECT COUNT(*) FROM orders) as total_orders,
                 (SELECT COUNT(*) FROM orders WHERE DATE(created_at) = CURRENT_DATE) as today_orders,
                 (SELECT COALESCE(SUM(total_amount), 0) FROM orders) as total_revenue,
@@ -38,7 +39,7 @@ router.get('/dashboard', async (req, res) => {
 router.get('/live/stats', isAdmin, async (req, res) => {
     try {
         const onlineAgents = await pool.query(
-            'SELECT COUNT(*) FROM agent_profiles WHERE is_online = true AND is_approved = true'
+            'SELECT COUNT(*) FROM agents WHERE is_online = true AND is_approved = true'
         );
         
         const activeUsers = await pool.query(
@@ -67,8 +68,8 @@ router.get('/live/stats', isAdmin, async (req, res) => {
         
         const agents = await pool.query(`
             SELECT a.*, u.full_name, u.phone_number
-            FROM agent_profiles a
-            JOIN users u ON a.user_id = u.id
+            FROM agents a
+            JOIN users u ON a.id = u.id
             WHERE a.is_online = true AND a.is_approved = true
             LIMIT 10
         `);
@@ -99,10 +100,8 @@ router.get('/live/stats', isAdmin, async (req, res) => {
 });
 
 // ============================================
-// ✅ CUSTOMERS - SPECIFIC ROUTES FIRST
+// ✅ CUSTOMERS
 // ============================================
-
-// GET customers list (for dropdown) - MUST come before /customers/:id
 router.get('/customers/list', isAdmin, async (req, res) => {
     try {
         const { search } = req.query;
@@ -132,7 +131,6 @@ router.get('/customers/list', isAdmin, async (req, res) => {
     }
 });
 
-// GET customers
 router.get('/customers', isAdmin, async (req, res) => {
     try {
         const result = await pool.query(`
@@ -162,7 +160,6 @@ router.get('/customers', isAdmin, async (req, res) => {
     }
 });
 
-// GET customer by ID - parameter route
 router.get('/customers/:id', isAdmin, async (req, res) => {
     try {
         const { id } = req.params;
@@ -251,7 +248,6 @@ router.put('/customers/:id/toggle-status', isAdmin, async (req, res) => {
     }
 });
 
-// Customer profile sub-resources
 router.get('/customers/:id/orders', isAdmin, async (req, res) => {
     try {
         const { id } = req.params;
@@ -376,9 +372,8 @@ router.get('/customers/:id/tickets', isAdmin, async (req, res) => {
 });
 
 // ============================================
-// ✅ AGENTS - SPECIFIC ROUTES FIRST
+// ✅ AGENTS
 // ============================================
-
 router.get('/agents/list', isAdmin, async (req, res) => {
     try {
         const result = await pool.query(`
@@ -389,8 +384,8 @@ router.get('/agents/list', isAdmin, async (req, res) => {
                 a.is_active,
                 u.full_name,
                 u.phone_number
-            FROM agent_profiles a
-            JOIN users u ON a.user_id = u.id
+            FROM agents a
+            JOIN users u ON a.id = u.id
             WHERE a.is_approved = true AND a.is_active = true
             ORDER BY a.business_name
         `);
@@ -409,15 +404,16 @@ router.get('/agents', isAdmin, async (req, res) => {
         const result = await pool.query(`
             SELECT 
                 a.id,
-                a.user_id,
                 a.business_name,
-                a.business_address,
-                a.business_registration,
+                a.partner_code,
                 a.is_approved,
                 a.is_active,
                 a.is_online,
                 a.commission_rate,
                 a.approval_date,
+                a.wallet_balance,
+                a.status AS agent_status,
+                a.flagged,
                 a.created_at,
                 a.updated_at,
                 u.full_name,
@@ -428,14 +424,13 @@ router.get('/agents', isAdmin, async (req, res) => {
                 COALESCE(COUNT(DISTINCT o.id), 0) as delivery_count,
                 COALESCE(SUM(o.total_amount), 0) as total_revenue,
                 COALESCE(AVG(o.customer_rating), 0) as rating
-            FROM agent_profiles a
-            JOIN users u ON a.user_id = u.id
+            FROM agents a
+            JOIN users u ON a.id = u.id
             LEFT JOIN orders o ON a.id = o.agent_id
             GROUP BY 
-                a.id, a.user_id, a.business_name, a.business_address, 
-                a.business_registration, a.is_approved, a.is_active, 
-                a.is_online, a.commission_rate, a.approval_date, 
-                a.created_at, a.updated_at,
+                a.id, a.business_name, a.partner_code, a.is_approved, 
+                a.is_active, a.is_online, a.commission_rate, a.approval_date, 
+                a.wallet_balance, a.status, a.flagged, a.created_at, a.updated_at,
                 u.full_name, u.phone_number, u.email, u.is_verified, u.last_login
             ORDER BY delivery_count DESC, a.created_at DESC
         `);
@@ -450,8 +445,8 @@ router.get('/agents/pending', isAdmin, async (req, res) => {
     try {
         const result = await pool.query(`
             SELECT u.*, a.* 
-            FROM agent_profiles a
-            JOIN users u ON a.user_id = u.id
+            FROM agents a
+            JOIN users u ON a.id = u.id
             WHERE a.is_approved = false
             ORDER BY a.created_at DESC
         `);
@@ -467,8 +462,8 @@ router.get('/agents/:id', isAdmin, async (req, res) => {
         const { id } = req.params;
         const result = await pool.query(`
             SELECT u.*, a.* 
-            FROM agent_profiles a
-            JOIN users u ON a.user_id = u.id
+            FROM agents a
+            JOIN users u ON a.id = u.id
             WHERE a.id = $1
         `, [id]);
         
@@ -486,7 +481,7 @@ router.put('/agents/:id/approve', isAdmin, async (req, res) => {
     try {
         const { id } = req.params;
         const result = await pool.query(
-            `UPDATE agent_profiles 
+            `UPDATE agents 
              SET is_approved = true, approval_date = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
              WHERE id = $1 
              RETURNING *`,
@@ -507,7 +502,7 @@ router.delete('/agents/:id/reject', isAdmin, async (req, res) => {
     try {
         const { id } = req.params;
         await pool.query(
-            'UPDATE agent_profiles SET is_active = false, deleted_at = CURRENT_TIMESTAMP WHERE id = $1',
+            'UPDATE agents SET is_active = false, deleted_at = CURRENT_TIMESTAMP WHERE id = $1',
             [id]
         );
         res.json({ success: true, message: 'Agent rejected' });
@@ -521,7 +516,7 @@ router.put('/agents/:id/ban', isAdmin, async (req, res) => {
     try {
         const { id } = req.params;
         const result = await pool.query(
-            'UPDATE agent_profiles SET is_active = false, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *',
+            'UPDATE agents SET is_active = false, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *',
             [id]
         );
         
@@ -539,7 +534,7 @@ router.put('/agents/:id/unban', isAdmin, async (req, res) => {
     try {
         const { id } = req.params;
         const result = await pool.query(
-            'UPDATE agent_profiles SET is_active = true, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *',
+            'UPDATE agents SET is_active = true, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *',
             [id]
         );
         
@@ -602,7 +597,7 @@ router.get('/agents/:id/payments', isAdmin, async (req, res) => {
                 p.created_at,
                 p.updated_at
             FROM payments p
-            WHERE p.user_id = (SELECT user_id FROM agent_profiles WHERE id = $1)
+            WHERE p.user_id = $1
             ORDER BY p.created_at DESC
         `, [id]);
         
@@ -915,7 +910,7 @@ router.get('/orders', isAdmin, async (req, res) => {
                 o.product_price as unit_price
             FROM orders o
             LEFT JOIN users u ON o.customer_id = u.id
-            LEFT JOIN agent_profiles a ON o.agent_id = a.id
+            LEFT JOIN agents a ON o.agent_id = a.id
             LEFT JOIN products p ON o.product_id = p.id
             ORDER BY o.created_at DESC
         `);
@@ -940,7 +935,7 @@ router.get('/orders/:id', isAdmin, async (req, res) => {
                 p.brand_name as product_brand
             FROM orders o
             LEFT JOIN users u ON o.customer_id = u.id
-            LEFT JOIN agent_profiles a ON o.agent_id = a.id
+            LEFT JOIN agents a ON o.agent_id = a.id
             LEFT JOIN products p ON o.product_id = p.id
             WHERE o.id = $1
         `, [id]);
@@ -993,8 +988,6 @@ router.put('/orders/:id/status', isAdmin, async (req, res) => {
             [status, id]
         );
         
-        console.log(`✅ Order ${id} status updated to: ${status}`);
-        
         res.json({
             success: true,
             message: 'Order status updated successfully',
@@ -1040,8 +1033,6 @@ router.put('/orders/:id/assign-agent', isAdmin, async (req, res) => {
         const { id } = req.params;
         const { agent_id } = req.body;
         
-        console.log('📦 Assign agent request:', { orderId: id, agentId: agent_id });
-        
         if (!agent_id) {
             return res.status(400).json({
                 success: false,
@@ -1061,10 +1052,8 @@ router.put('/orders/:id/assign-agent', isAdmin, async (req, res) => {
             });
         }
         
-        console.log('📦 Current order status:', orderCheck.rows[0].status);
-        
         const agentCheck = await pool.query(
-            'SELECT id, business_name FROM agent_profiles WHERE id = $1 AND is_approved = true',
+            'SELECT id, business_name FROM agents WHERE id = $1 AND is_approved = true',
             [agent_id]
         );
         
@@ -1074,8 +1063,6 @@ router.put('/orders/:id/assign-agent', isAdmin, async (req, res) => {
                 message: 'Approved agent not found'
             });
         }
-        
-        console.log('✅ Agent found:', agentCheck.rows[0].business_name);
         
         const result = await pool.query(
             `UPDATE orders 
@@ -1095,9 +1082,6 @@ router.put('/orders/:id/assign-agent', isAdmin, async (req, res) => {
             [agent_id, id]
         );
         
-        console.log('✅ Order updated:', result.rows[0]);
-        console.log('✅ New status:', result.rows[0].status);
-        
         res.json({
             success: true,
             message: 'Agent assigned successfully. Order status updated to assigned.',
@@ -1105,8 +1089,7 @@ router.put('/orders/:id/assign-agent', isAdmin, async (req, res) => {
         });
         
     } catch (error) {
-        console.error('❌ Assign agent error:', error);
-        console.error('❌ Error stack:', error.stack);
+        console.error('Assign agent error:', error);
         res.status(500).json({
             success: false,
             message: 'Failed to assign agent',
@@ -1132,8 +1115,6 @@ router.post('/orders/create', isAdmin, async (req, res) => {
             delivery_fee,
         } = req.body;
 
-        console.log('📦 Create order request:', JSON.stringify(req.body, null, 2));
-
         const customerCheck = await client.query(
             'SELECT id, full_name, phone_number FROM users WHERE id = $1 AND user_type = \'customer\' AND is_active = true',
             [customer_id]
@@ -1148,7 +1129,6 @@ router.post('/orders/create', isAdmin, async (req, res) => {
         }
         
         const customer = customerCheck.rows[0];
-        console.log('✅ Customer found:', customer.full_name);
         
         const productCheck = await client.query(
             'SELECT id, name, brand_name, base_price FROM products WHERE id = $1 AND is_active = true',
@@ -1164,14 +1144,13 @@ router.post('/orders/create', isAdmin, async (req, res) => {
         }
         
         const product = productCheck.rows[0];
-        console.log('✅ Product found:', product.name);
         
         let agentInfo = null;
         let orderStatus = 'pending';
         
         if (agent_id) {
             const agentCheck = await client.query(
-                'SELECT id, business_name FROM agent_profiles WHERE id = $1 AND is_approved = true AND is_active = true',
+                'SELECT id, business_name FROM agents WHERE id = $1 AND is_approved = true AND is_active = true',
                 [agent_id]
             );
             
@@ -1184,8 +1163,6 @@ router.post('/orders/create', isAdmin, async (req, res) => {
             }
             agentInfo = agentCheck.rows[0];
             orderStatus = 'assigned';
-            console.log('✅ Agent found:', agentInfo.business_name);
-            console.log('✅ Order will be created with status: assigned');
         }
         
         if (!quantity || quantity < 1) {
@@ -1209,13 +1186,9 @@ router.post('/orders/create', isAdmin, async (req, res) => {
         const deliveryFee = parseFloat(delivery_fee) || 100;
         const total = subtotal + deliveryFee;
         
-        console.log('💰 Calculated totals:', { unit_price, subtotal, deliveryFee, total });
-        
         const timestamp = Date.now().toString().slice(-8);
         const random = Math.random().toString(36).substring(2, 6).toUpperCase();
         const orderNumber = `ADM${timestamp}${random}`;
-        
-        console.log('📦 Generated order number:', orderNumber);
         
         const insertResult = await client.query(
             `INSERT INTO orders (
@@ -1256,7 +1229,6 @@ router.post('/orders/create', isAdmin, async (req, res) => {
         );
         
         const order = insertResult.rows[0];
-        console.log('✅ Order inserted:', order);
         
         try {
             const itemCheck = await client.query(`
@@ -1277,15 +1249,12 @@ router.post('/orders/create', isAdmin, async (req, res) => {
                     ) VALUES ($1, $2, $3, $4, $5)`,
                     [order.id, product_id, quantity, unit_price, subtotal]
                 );
-                console.log('✅ Order item inserted');
             }
         } catch (err) {
-            console.log('📝 Note: order_items insert skipped:', err.message);
+            console.log('Note: order_items insert skipped:', err.message);
         }
         
         await client.query('COMMIT');
-        
-        console.log('✅ Order created successfully:', order.order_number);
         
         res.status(201).json({
             success: true,
@@ -1327,7 +1296,7 @@ router.post('/orders/create', isAdmin, async (req, res) => {
         
     } catch (error) {
         await client.query('ROLLBACK');
-        console.error('❌ Admin create order error:', error);
+        console.error('Admin create order error:', error);
         
         res.status(500).json({
             success: false,
@@ -1354,7 +1323,7 @@ router.get('/orders/customer/:customerId', isAdmin, async (req, res) => {
             FROM orders o
             LEFT JOIN products p ON o.product_id = p.id
             LEFT JOIN users u ON o.customer_id = u.id
-            LEFT JOIN agent_profiles a ON o.agent_id = a.id
+            LEFT JOIN agents a ON o.agent_id = a.id
             WHERE o.customer_id = $1
             ORDER BY o.created_at DESC
         `, [customerId]);
@@ -1387,6 +1356,65 @@ router.put('/orders/bulk-status', isAdmin, async (req, res) => {
         console.error('Bulk update error:', error);
         res.status(500).json({ error: 'Failed to bulk update orders' });
     }
+});
+
+// ============================================
+// LIVE AGENT TRACKING
+// ============================================
+router.get('/orders/live-tracking', isAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        o.id AS order_id,
+        o.order_number,
+        o.status,
+        o.agent_current_lat AS agent_lat,
+        o.agent_current_lng AS agent_lng,
+        o.customer_latitude AS customer_lat,
+        o.customer_longitude AS customer_lng,
+        a.business_name AS agent_name,
+        u.phone_number AS agent_phone
+      FROM orders o
+      JOIN agents a ON a.id = o.agent_id
+      LEFT JOIN users u ON u.id = a.id
+      WHERE o.status IN ('accepted', 'out_for_delivery')
+      ORDER BY o.updated_at DESC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Live tracking error:', err);
+    res.status(500).json({ error: 'Failed to fetch live orders' });
+  }
+});
+
+router.get('/agents/live-map', isAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        a.id, 
+        a.business_name, 
+        a.is_online, 
+        a.is_approved,
+        a.is_active,
+        ST_Y(a.location::geometry) AS lat,
+        ST_X(a.location::geometry) AS lng,
+        u.phone_number,
+        u.full_name AS owner_name,
+        (
+          SELECT COUNT(*) 
+          FROM orders o 
+          WHERE o.agent_id = a.id 
+            AND o.status IN ('assigned', 'accepted', 'out_for_delivery')
+        ) AS active_orders
+      FROM agents a
+      LEFT JOIN users u ON u.id = a.id
+      WHERE a.is_active = true
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Live map fetch error:', err);
+    res.status(500).json({ error: 'Failed to fetch agents' });
+  }
 });
 
 // ============================================
@@ -1867,6 +1895,97 @@ router.delete('/support/tickets/:id', isAdmin, async (req, res) => {
 });
 
 // ============================================
+// SUPPORT CALLS (Agora live audio — browser ↔ mobile)
+// ============================================
+router.get('/support-calls/pending', isAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT 
+         sc.id, 
+         sc.caller_id, 
+         sc.caller_type, 
+         sc.channel_name, 
+         sc.status,
+         sc.created_at,
+         u.full_name AS caller_name,
+         u.phone_number AS caller_phone
+       FROM support_calls sc
+       LEFT JOIN users u ON u.id = sc.caller_id
+       WHERE sc.status = 'ringing'
+       ORDER BY sc.created_at ASC
+       LIMIT 5`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Pending support calls error:', err);
+    res.status(500).json({ error: 'Failed to fetch pending calls' });
+  }
+});
+
+router.post('/support-calls/:callId/answer', isAdmin, async (req, res) => {
+  try {
+    const { callId } = req.params;
+    const adminId = req.user.id;
+
+    if (!APP_ID) {
+      return res.status(500).json({ error: 'Agora not configured on server' });
+    }
+
+    const callRes = await pool.query(
+      `SELECT id, channel_name, status FROM support_calls WHERE id = $1`,
+      [callId]
+    );
+
+    if (callRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Support call not found' });
+    }
+
+    const call = callRes.rows[0];
+    if (call.status !== 'ringing') {
+      return res.status(400).json({ error: `Call is already ${call.status}` });
+    }
+
+    const uid = Math.floor(Math.random() * 1000000) + 1000;
+    const token = generateToken(call.channel_name, uid, 3600);
+
+    await pool.query(
+      `UPDATE support_calls
+       SET status = 'answered', admin_id = $1, answered_at = NOW()
+       WHERE id = $2`,
+      [adminId, callId]
+    );
+
+    res.json({
+      success: true,
+      token,
+      app_id: APP_ID,
+      channel_name: call.channel_name,
+      uid,
+      expires_in: 3600,
+    });
+  } catch (err) {
+    console.error('Answer support call error:', err);
+    res.status(500).json({ error: 'Failed to answer support call' });
+  }
+});
+
+router.post('/support-calls/:callId/end', isAdmin, async (req, res) => {
+  try {
+    const { callId } = req.params;
+    await pool.query(
+      `UPDATE support_calls
+       SET status = 'ended', ended_at = NOW()
+       WHERE id = $1 AND status IN ('ringing', 'answered')`,
+      [callId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('End support call error:', err);
+    res.status(500).json({ error: 'Failed to end support call' });
+  }
+});
+
+// ============================================
 // NOTIFICATIONS
 // ============================================
 router.get('/notifications', isAdmin, async (req, res) => {
@@ -1963,7 +2082,7 @@ router.get('/analytics', isAdmin, async (req, res) => {
                 COUNT(o.id) as delivery_count,
                 COALESCE(SUM(o.total_amount), 0) as revenue,
                 COALESCE(AVG(o.customer_rating), 0) as rating
-            FROM agent_profiles a
+            FROM agents a
             LEFT JOIN orders o ON a.id = o.agent_id AND o.status IN ('confirmed', 'delivered')
             GROUP BY a.id, a.business_name
             ORDER BY delivery_count DESC
@@ -2029,7 +2148,7 @@ router.get('/reports/agents', isAdmin, async (req, res) => {
                 COALESCE(SUM(o.total_amount), 0) as revenue,
                 COALESCE(AVG(o.customer_rating), 0) as rating,
                 COALESCE(SUM(o.total_amount) * 0.1, 0) as commission
-            FROM agent_profiles a
+            FROM agents a
             LEFT JOIN orders o ON a.id = o.agent_id AND o.status = 'confirmed'
             GROUP BY a.id, a.business_name
             ORDER BY deliveries DESC
@@ -2074,7 +2193,7 @@ router.get('/trash', isAdmin, async (req, res) => {
         );
         
         const agents = await pool.query(
-            "SELECT 'agent' as type, a.id, u.full_name as name, u.phone_number, a.deleted_at FROM agent_profiles a JOIN users u ON a.user_id = u.id WHERE a.is_active = false"
+            "SELECT 'agent' as type, a.id, u.full_name as name, u.phone_number, a.deleted_at FROM agents a JOIN users u ON a.id = u.id WHERE a.is_active = false"
         );
         
         const products = await pool.query(
@@ -2102,7 +2221,7 @@ router.put('/trash/restore/:type/:id', isAdmin, async (req, res) => {
                 await pool.query('UPDATE users SET is_active = true, deleted_at = NULL WHERE id = $1', [id]);
                 break;
             case 'agent':
-                await pool.query('UPDATE agent_profiles SET is_active = true, deleted_at = NULL WHERE id = $1', [id]);
+                await pool.query('UPDATE agents SET is_active = true, deleted_at = NULL WHERE id = $1', [id]);
                 break;
             case 'product':
                 await pool.query('UPDATE products SET is_active = true, deleted_at = NULL WHERE id = $1', [id]);
@@ -2130,7 +2249,7 @@ router.delete('/trash/permanent/:type/:id', isAdmin, async (req, res) => {
                 await pool.query('DELETE FROM users WHERE id = $1', [id]);
                 break;
             case 'agent':
-                await pool.query('DELETE FROM agent_profiles WHERE id = $1', [id]);
+                await pool.query('DELETE FROM agents WHERE id = $1', [id]);
                 break;
             case 'product':
                 await pool.query('DELETE FROM products WHERE id = $1', [id]);
@@ -2147,71 +2266,6 @@ router.delete('/trash/permanent/:type/:id', isAdmin, async (req, res) => {
         console.error('Permanent delete error:', error);
         res.status(500).json({ error: 'Failed to permanently delete item' });
     }
-});
-
-
-
-// ============================================
-// LIVE AGENT TRACKING
-// ============================================
-router.get('/orders/live-tracking', isAdmin, async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT
-        o.id AS order_id,
-        o.order_number,
-        o.status,
-        o.agent_current_lat AS agent_lat,
-        o.agent_current_lng AS agent_lng,
-        o.customer_latitude AS customer_lat,
-        o.customer_longitude AS customer_lng,
-        a.business_name AS agent_name,
-        u.phone_number AS agent_phone
-      FROM orders o
-      JOIN agents a ON a.id = o.agent_id
-      LEFT JOIN users u ON u.id = a.id
-      WHERE o.status IN ('accepted', 'out_for_delivery')
-      ORDER BY o.updated_at DESC
-    `);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Live tracking error:', err);
-    res.status(500).json({ error: 'Failed to fetch live orders' });
-  }
-});
-
-
-// ============================================
-// LIVE AGENTS MAP (All agents)
-// ============================================
-router.get('/agents/live-map', isAdmin, async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT 
-        a.id, 
-        a.business_name, 
-        a.is_online, 
-        a.is_approved,
-        a.is_active,
-        ST_Y(a.location::geometry) AS lat,
-        ST_X(a.location::geometry) AS lng,
-        u.phone_number,
-        u.full_name AS owner_name,
-        (
-          SELECT COUNT(*) 
-          FROM orders o 
-          WHERE o.agent_id = a.id 
-            AND o.status IN ('assigned', 'accepted', 'out_for_delivery')
-        ) AS active_orders
-      FROM agents a
-      LEFT JOIN users u ON u.id = a.id
-      WHERE a.is_active = true
-    `);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Live map fetch error:', err);
-    res.status(500).json({ error: 'Failed to fetch agents' });
-  }
 });
 
 // ============================================
@@ -2344,7 +2398,7 @@ router.put('/agents/bulk-approve', isAdmin, async (req, res) => {
     try {
         const { agentIds } = req.body;
         const result = await pool.query(
-            'UPDATE agent_profiles SET is_approved = true, approval_date = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ANY($1) RETURNING *',
+            'UPDATE agents SET is_approved = true, approval_date = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ANY($1) RETURNING *',
             [agentIds]
         );
         res.json(result.rows);
@@ -2357,8 +2411,6 @@ router.put('/agents/bulk-approve', isAdmin, async (req, res) => {
 // ============================================
 // WALLET / GRACE PERIOD — AGENT OVERSIGHT
 // ============================================
-
-// GET /api/admin/agents/flagged — list grace-period + flagged + blacklisted agents
 router.get('/agents/flagged', async (req, res) => {
     try {
         const r = await pool.query(
@@ -2385,7 +2437,6 @@ router.get('/agents/flagged', async (req, res) => {
     }
 });
 
-// POST /api/admin/agent/:id/unblock  { reason }
 router.post('/agent/:id/unblock', async (req, res) => {
     try {
         const { id } = req.params;
@@ -2400,7 +2451,6 @@ router.post('/agent/:id/unblock', async (req, res) => {
     }
 });
 
-// POST /api/admin/agent/:id/blacklist  { reason }
 router.post('/agent/:id/blacklist', async (req, res) => {
     try {
         const { id } = req.params;
@@ -2431,9 +2481,9 @@ router.post('/agent/:id/blacklist', async (req, res) => {
     }
 });
 
-// ================================================================
+// ============================================
 // TEMPORARY DEBUG — remove after diagnosing
-// ================================================================
+// ============================================
 router.get('/debug/:phone', async (req, res) => {
   try {
     const { phone } = req.params;

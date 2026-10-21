@@ -2182,6 +2182,39 @@ router.get('/orders/live-tracking', isAdmin, async (req, res) => {
 
 
 // ============================================
+// LIVE AGENTS MAP (All agents)
+// ============================================
+router.get('/agents/live-map', isAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        a.id, 
+        a.business_name, 
+        a.is_online, 
+        a.is_approved,
+        a.is_active,
+        ST_Y(a.location::geometry) AS lat,
+        ST_X(a.location::geometry) AS lng,
+        u.phone_number,
+        u.full_name AS owner_name,
+        (
+          SELECT COUNT(*) 
+          FROM orders o 
+          WHERE o.agent_id = a.id 
+            AND o.status IN ('assigned', 'accepted', 'out_for_delivery')
+        ) AS active_orders
+      FROM agents a
+      LEFT JOIN users u ON u.id = a.id
+      WHERE a.is_active = true
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Live map fetch error:', err);
+    res.status(500).json({ error: 'Failed to fetch agents' });
+  }
+});
+
+// ============================================
 // EXPORTS
 // ============================================
 router.get('/exports/orders', isAdmin, async (req, res) => {

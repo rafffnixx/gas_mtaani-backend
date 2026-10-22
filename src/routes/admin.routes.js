@@ -6,6 +6,7 @@ const { pool } = require('../config/database');
 const { authenticate, isAdmin } = require('../middleware/auth.middleware');
 const walletService = require('../services/walletService');
 const { generateToken, APP_ID } = require('../services/agoraService');
+const { processFirstOrderCommission } = require('../services/marketerCommission');   // ── NEW
 
 // Apply JWT + admin role check to every route in this file
 router.use(authenticate);
@@ -951,31 +952,36 @@ router.get('/orders/:id', isAdmin, async (req, res) => {
 });
 
 router.put('/orders/:id/status', isAdmin, async (req, res) => {
+    const client = await pool.connect();
     try {
+        await client.query('BEGIN');
+
         const { id } = req.params;
         const { status } = req.body;
         
         const validStatuses = ['pending', 'assigned', 'accepted', 'picked_up', 'out_for_delivery', 'delivered', 'confirmed', 'cancelled', 'declined'];
         if (!validStatuses.includes(status)) {
+            await client.query('ROLLBACK');
             return res.status(400).json({
                 success: false,
                 message: `Invalid status. Must be one of: ${validStatuses.join(', ')}`
             });
         }
         
-        const checkOrder = await pool.query(
+        const checkOrder = await client.query(
             'SELECT id FROM orders WHERE id = $1',
             [id]
         );
         
         if (checkOrder.rows.length === 0) {
+            await client.query('ROLLBACK');
             return res.status(404).json({
                 success: false,
                 message: 'Order not found'
             });
         }
         
-        const result = await pool.query(
+        const result = await client.query(
             `UPDATE orders 
              SET status = $1, 
                  updated_at = CURRENT_TIMESTAMP
@@ -984,21 +990,36 @@ router.put('/orders/:id/status', isAdmin, async (req, res) => {
                 id, 
                 order_number, 
                 status, 
-                updated_at`,
+                updated_at,
+                customer_id`,
             [status, id]
         );
+        
+        const updatedOrder = result.rows[0];
+
+        // ── NEW: marketer commission on first delivered order ──
+        if (status === 'delivered' && updatedOrder) {
+            await processFirstOrderCommission(client, updatedOrder.id, updatedOrder.customer_id);
+        }
+        // ───────────────────────────────────────────────────────
+
+        await client.query('COMMIT');
         
         res.json({
             success: true,
             message: 'Order status updated successfully',
-            data: result.rows[0]
+            data: updatedOrder
         });
     } catch (error) {
+        await client.query('ROLLBACK');
         console.error('Update order status error:', error);
         res.status(500).json({
             success: false,
-            message: 'Failed to update order status'
+            message: 'Failed to update order status',
+            detail: error.message
         });
+    } finally {
+        client.release();
     }
 });
 
@@ -1339,22 +1360,39 @@ router.get('/orders/customer/:customerId', isAdmin, async (req, res) => {
 });
 
 router.put('/orders/bulk-status', isAdmin, async (req, res) => {
+    const client = await pool.connect();
     try {
+        await client.query('BEGIN');
+
         const { orderIds, status } = req.body;
         
         const validStatuses = ['pending', 'assigned', 'accepted', 'picked_up', 'out_for_delivery', 'delivered', 'confirmed', 'cancelled'];
         if (!validStatuses.includes(status)) {
+            await client.query('ROLLBACK');
             return res.status(400).json({ error: 'Invalid status' });
         }
         
-        const result = await pool.query(
-            'UPDATE orders SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = ANY($2) RETURNING *',
+        const result = await client.query(
+            'UPDATE orders SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = ANY($2) RETURNING id, customer_id, status, order_number, updated_at',
             [status, orderIds]
         );
+
+        // ── NEW: marketer commission for each newly-delivered order ──
+        if (status === 'delivered') {
+            for (const order of result.rows) {
+                await processFirstOrderCommission(client, order.id, order.customer_id);
+            }
+        }
+        // ─────────────────────────────────────────────────────────────
+
+        await client.query('COMMIT');
         res.json(result.rows);
     } catch (error) {
+        await client.query('ROLLBACK');
         console.error('Bulk update error:', error);
-        res.status(500).json({ error: 'Failed to bulk update orders' });
+        res.status(500).json({ error: 'Failed to bulk update orders', detail: error.message });
+    } finally {
+        client.release();
     }
 });
 
@@ -2371,7 +2409,6 @@ router.get('/support-calls/active', isAdmin, async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch active calls' });
   }
 });
-
 
 router.get('/exports/products', isAdmin, async (req, res) => {
     try {

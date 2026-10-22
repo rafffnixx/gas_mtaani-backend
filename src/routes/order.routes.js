@@ -9,6 +9,7 @@ const {
   clearAllTimers,
   scheduleSearchTimeout,
 } = require('../services/orderSearch');
+const { processFirstOrderCommission } = require('../services/marketerCommission');   // ── NEW
 
 // =====================================================
 // CREATE ORDER (Customer)
@@ -407,14 +408,17 @@ router.put(
 );
 
 // =====================================================
-// MARK AS DELIVERED (Agent)
+// MARK AS DELIVERED (Agent) — now wraps commission hook
 // =====================================================
 router.put('/:orderId/deliver', authenticate, isAgent, async (req, res) => {
+  const client = await pool.connect();
   try {
+    await client.query('BEGIN');
+
     const agentId = req.user.id;
     const { orderId } = req.params;
 
-    const result = await pool.query(
+    const result = await client.query(
       `UPDATE orders
        SET status = 'delivered',
            delivered_at = NOW(),
@@ -425,21 +429,33 @@ router.put('/:orderId/deliver', authenticate, isAgent, async (req, res) => {
     );
 
     if (result.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({
         error: 'Order not found or cannot be delivered',
       });
     }
 
-    await notifyOrderEvent(result.rows[0], 'delivered');
+    const order = result.rows[0];
+
+    // ── NEW: marketer commission on first delivered order ──
+    await processFirstOrderCommission(client, order.id, order.customer_id);
+    // ───────────────────────────────────────────────────────
+
+    await client.query('COMMIT');
+
+    await notifyOrderEvent(order, 'delivered');
 
     res.json({
       success: true,
       message: 'Order marked as delivered',
-      order: result.rows[0],
+      order,
     });
   } catch (error) {
+    await client.query('ROLLBACK');
     console.error('Deliver order error:', error);
     res.status(500).json({ error: 'Failed to mark as delivered' });
+  } finally {
+    client.release();
   }
 });
 

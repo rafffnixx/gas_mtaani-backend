@@ -89,6 +89,8 @@ const agoraRoutes         = require('./routes/agora.routes');
 const businessHoursRoutes = require('./routes/businessHours.routes');
 const notificationPreferencesRoutes = require('./routes/notificationPreferences.routes');
 const agentDocumentsRoutes = require('./routes/agentDocuments.routes');
+const marketerRoutes = require('./routes/marketer.routes');
+
 
 // ============================================
 // Background services
@@ -131,6 +133,8 @@ app.use('/api/orders',    orderRoutes);
 
 app.use('/api/admin',     adminRoutes);
 app.use('/api/payments',  paymentRoutes);
+app.use('/api/marketers', marketerRoutes);
+
 
 // ============================================
 // Health check

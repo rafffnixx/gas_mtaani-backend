@@ -6,7 +6,10 @@ const { pool } = require('../config/database');
 const { authenticate, isAdmin } = require('../middleware/auth.middleware');
 const walletService = require('../services/walletService');
 const { generateToken, APP_ID } = require('../services/agoraService');
-const { processFirstOrderCommission } = require('../services/marketerCommission');   // ── NEW
+const {
+  processFirstOrderCommission,
+  processFirstAgentCommission,   // ← NEW
+} = require('../services/marketerCommission');
 
 // Apply JWT + admin role check to every route in this file
 router.use(authenticate);
@@ -991,17 +994,19 @@ router.put('/orders/:id/status', isAdmin, async (req, res) => {
                 order_number, 
                 status, 
                 updated_at,
-                customer_id`,
+                customer_id,
+                agent_id`,
             [status, id]
         );
         
         const updatedOrder = result.rows[0];
 
-        // ── NEW: marketer commission on first delivered order ──
+        // ── Marketer commissions on first delivered order (customer + agent) ──
         if (status === 'delivered' && updatedOrder) {
             await processFirstOrderCommission(client, updatedOrder.id, updatedOrder.customer_id);
+            await processFirstAgentCommission(client, updatedOrder.id, updatedOrder.agent_id);   // ← NEW
         }
-        // ───────────────────────────────────────────────────────
+        // ───────────────────────────────────────────────────────────────────────
 
         await client.query('COMMIT');
         
@@ -1373,17 +1378,18 @@ router.put('/orders/bulk-status', isAdmin, async (req, res) => {
         }
         
         const result = await client.query(
-            'UPDATE orders SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = ANY($2) RETURNING id, customer_id, status, order_number, updated_at',
+            'UPDATE orders SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = ANY($2) RETURNING id, customer_id, agent_id, status, order_number, updated_at',
             [status, orderIds]
         );
 
-        // ── NEW: marketer commission for each newly-delivered order ──
+        // ── Marketer commissions for each newly-delivered order (customer + agent) ──
         if (status === 'delivered') {
             for (const order of result.rows) {
                 await processFirstOrderCommission(client, order.id, order.customer_id);
+                await processFirstAgentCommission(client, order.id, order.agent_id);   // ← NEW
             }
         }
-        // ─────────────────────────────────────────────────────────────
+        // ───────────────────────────────────────────────────────────────────────────
 
         await client.query('COMMIT');
         res.json(result.rows);

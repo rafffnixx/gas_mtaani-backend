@@ -25,6 +25,9 @@ async function sendPushToUser(userId, { title, body, data = {} }) {
     const token = rows[0]?.expo_push_token;
     if (!token) return null; // user hasn't registered for push
 
+    // Check if this is an incoming call
+    const isCall = data.type === 'incoming_call';
+
     const message = {
       to: token,
       sound: 'default',
@@ -32,7 +35,9 @@ async function sendPushToUser(userId, { title, body, data = {} }) {
       body,
       data,
       priority: 'high',
-      channelId: 'default',
+      // If it's a call, use the high-priority channel and category. Otherwise, default.
+      channelId: isCall ? 'incoming-call' : 'default',
+      ...(isCall && { categoryId: 'incoming_call' }), 
     };
 
     const res = await fetch(EXPO_PUSH_URL, {
@@ -41,13 +46,14 @@ async function sendPushToUser(userId, { title, body, data = {} }) {
         'Content-Type': 'application/json',
         Accept: 'application/json',
       },
-      body: JSON.stringify(message),
+      // Expo expects an array of messages
+      body: JSON.stringify([message]),
     });
 
     const result = await res.json().catch(() => null);
 
     // If the token is dead, clear it
-    const ticket = result?.data;
+    const ticket = result?.data?.[0]; // Expo returns an array
     if (ticket?.status === 'error') {
       const errCode = ticket?.details?.error;
       if (errCode === 'DeviceNotRegistered') {

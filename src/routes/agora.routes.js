@@ -7,9 +7,9 @@ const {
   generateToken,
   orderChannelName,
   supportChannelName,
-  ringOrderCounterparty,
   APP_ID,
 } = require('../services/agoraService');
+const { sendPushToUser } = require('../services/pushService');
 
 // GET APP ID
 router.get('/app-id', (req, res) => {
@@ -123,16 +123,22 @@ router.post('/order-call/:orderId/ring', authenticate, async (req, res) => {
 
     const callerName = isCustomer ? order.customer_name : order.agent_name;
 
-    const result = await ringOrderCounterparty({
-      orderId,
-      calleeId,
-      callerName,
+    // ── TRIGGER THE FULL-SCREEN CALL PUSH ──
+    const result = await sendPushToUser(calleeId, {
+      title: 'Incoming Call',
+      body: `${callerName} is calling you`,
+      data: {
+        type: 'incoming_call',             // Tells the app to show the call screen
+        orderId: orderId,
+        channelName: `order:${orderId}`,   // Matches the Agora channel
+        callerName: callerName,
+      },
     });
 
     res.json({
       success: true,
-      push_sent: result.sent,
-      reason: result.reason || null,
+      push_sent: result?.data?.[0]?.status === 'ok',
+      reason: result?.data?.[0]?.message || null,
     });
   } catch (error) {
     console.error('Ring order error:', error);
@@ -190,7 +196,7 @@ router.get('/history', authenticate, async (req, res) => {
 });
 
 // =====================================================
-// SUPPORT CALLS (Keep existing logic)
+// SUPPORT CALLS
 // =====================================================
 router.post('/support-call/token', authenticate, async (req, res) => {
   try {

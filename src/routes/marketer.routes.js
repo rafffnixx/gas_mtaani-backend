@@ -98,6 +98,46 @@ router.post('/auth/login', async (req, res) => {
 });
 
 // ============================================================
+// PUBLIC — Validate a promo code (mobile app calls this live)
+// ============================================================
+router.get('/promo-code/:code', async (req, res) => {
+  try {
+    const code = String(req.params.code || '').trim().toUpperCase();
+    if (!code) return res.status(400).json({ valid: false, error: 'code required' });
+
+    const { rows } = await pool.query(
+      `SELECT pc.code, pc.period, pc.applies_to,
+              m.full_name AS marketer_name
+       FROM promo_codes pc
+       JOIN marketers m ON m.id = pc.marketer_id
+       WHERE pc.code = $1
+         AND pc.is_active = true
+         AND m.is_approved = true
+         AND m.is_active = true`,
+      [code]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({
+        valid: false,
+        error: "Invalid or expired code. Ask your promoter for this month's code.",
+      });
+    }
+
+    res.json({
+      valid: true,
+      code: rows[0].code,
+      marketer_name: rows[0].marketer_name,
+      period: rows[0].period,
+      applies_to: rows[0].applies_to,
+    });
+  } catch (err) {
+    console.error('Promo code lookup error:', err);
+    res.status(500).json({ valid: false, error: 'Lookup failed' });
+  }
+});
+
+// ============================================================
 // AUTHENTICATED — PROFILE + STATS
 // ============================================================
 router.get('/auth/me', marketerAuth, async (req, res) => {
@@ -147,8 +187,18 @@ router.get('/auth/me', marketerAuth, async (req, res) => {
       [marketerId]
     );
 
+    // ── Current month's active promo code ──
+    const currentPromo = await pool.query(
+      `SELECT code, period FROM promo_codes
+       WHERE marketer_id = $1 AND is_active = true
+       ORDER BY created_at DESC LIMIT 1`,
+      [marketerId]
+    );
+
     res.json({
       ...profile.rows[0],
+      current_promo_code: currentPromo.rows[0]?.code || null,
+      current_promo_period: currentPromo.rows[0]?.period || null,
       stats: {
         registrations: Number(counts.rows[0].registrations),
         first_orders:  Number(counts.rows[0].first_orders),
@@ -164,7 +214,7 @@ router.get('/auth/me', marketerAuth, async (req, res) => {
 });
 
 // ============================================================
-// REGISTRATIONS
+// REGISTRATIONS — read-only list of people attributed via code
 // ============================================================
 router.get('/registrations', marketerAuth, async (req, res) => {
   try {
@@ -172,16 +222,17 @@ router.get('/registrations', marketerAuth, async (req, res) => {
     const { rows } = await pool.query(
       `SELECT r.id,
               r.registered_at,
+              r.user_type,
               r.first_order_id,
               r.first_order_at,
-              u.id            AS customer_id,
-              u.full_name     AS customer_name,
-              u.phone_number  AS customer_phone,
+              u.id            AS user_id,
+              u.full_name     AS user_name,
+              u.phone_number  AS user_phone,
               (r.first_order_id IS NOT NULL) AS has_first_order,
               c.amount AS commission_amount,
               c.status AS commission_status
        FROM marketer_registrations r
-       JOIN users u ON u.id = r.customer_id
+       JOIN users u ON u.id = r.user_id
        LEFT JOIN marketer_commissions c ON c.registration_id = r.id
        WHERE r.marketer_id = $1
        ORDER BY r.registered_at DESC`,
@@ -191,76 +242,6 @@ router.get('/registrations', marketerAuth, async (req, res) => {
   } catch (err) {
     console.error('List registrations error:', err);
     res.status(500).json({ error: 'Failed to list registrations' });
-  }
-});
-
-router.post('/registrations', marketerAuth, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const marketerId = req.user.id;
-    const { phone_number, full_name, county, sub_county } = req.body || {};
-
-    if (!phone_number) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'phone_number is required' });
-    }
-    const normalized = String(phone_number).replace(/[^0-9]/g, '').replace(/^0/, '254');
-    if (normalized.length < 10) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Invalid phone number' });
-    }
-
-    let customerId;
-    const existing = await client.query(
-      `SELECT id FROM users WHERE phone_number = $1`, [normalized]
-    );
-    if (existing.rows.length > 0) {
-      customerId = existing.rows[0].id;
-    } else {
-      const tempHash = await bcrypt.hash(
-        'temp-' + crypto.randomBytes(8).toString('hex'), 10
-      );
-      const ins = await client.query(
-        `INSERT INTO users
-           (id, phone_number, full_name, user_type, password_hash,
-            county, sub_county, is_active, created_at)
-         VALUES (gen_random_uuid(), $1, $2, 'customer', $3, $4, $5, true, now())
-         RETURNING id`,
-        [normalized, full_name || 'New Customer', tempHash,
-         county || null, sub_county || null]
-      );
-      customerId = ins.rows[0].id;
-    }
-
-    try {
-      await client.query(
-        `INSERT INTO marketer_registrations (marketer_id, customer_id)
-         VALUES ($1, $2)`,
-        [marketerId, customerId]
-      );
-    } catch (e) {
-      if (e.code === '23505') {
-        await client.query('ROLLBACK');
-        return res.status(409).json({
-          error: 'This customer is already registered by another marketer',
-        });
-      }
-      throw e;
-    }
-
-    await client.query('COMMIT');
-    res.status(201).json({
-      customer_id: customerId,
-      phone_number: normalized,
-      message: 'Customer registered. Commission unlocks on their first delivered order.',
-    });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('Register customer error:', err);
-    res.status(500).json({ error: 'Registration failed', detail: err.message });
-  } finally {
-    client.release();
   }
 });
 
@@ -280,10 +261,11 @@ router.get('/commissions', marketerAuth, async (req, res) => {
     const { rows } = await pool.query(
       `SELECT c.id, c.order_id, c.amount, c.status,
               c.created_at, c.approved_at, c.paid_at,
-              u.full_name AS customer_name
+              u.full_name AS user_name,
+              r.user_type
        FROM marketer_commissions c
        JOIN marketer_registrations r ON r.id = c.registration_id
-       JOIN users u ON u.id = r.customer_id
+       JOIN users u ON u.id = r.user_id
        ${where}
        ORDER BY c.created_at DESC`,
       params
@@ -446,6 +428,87 @@ router.put('/admin/:id/commission-rate', isAdmin, async (req, res) => {
 });
 
 // ============================================================
+// ADMIN — PROMO CODES
+// ============================================================
+router.get('/admin/promo-codes', isAdmin, async (req, res) => {
+  try {
+    const { period } = req.query;
+    const params = [];
+    let where = '';
+    if (period) {
+      params.push(period);
+      where = 'WHERE pc.period = $1';
+    }
+    const { rows } = await pool.query(
+      `SELECT pc.id, pc.code, pc.period, pc.applies_to, pc.is_active,
+              pc.created_at, pc.deactivated_at,
+              m.id AS marketer_id, m.full_name, m.phone_number
+       FROM promo_codes pc
+       JOIN marketers m ON m.id = pc.marketer_id
+       ${where}
+       ORDER BY pc.created_at DESC, m.full_name`,
+      params
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error('List promo codes error:', err);
+    res.status(500).json({ error: 'Failed to list promo codes' });
+  }
+});
+
+router.post('/admin/promo-codes/rotate', isAdmin, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const period = String(req.body?.period || new Date().toISOString().slice(0, 7)); // YYYY-MM
+    const monthAbbr = new Date(period + '-01')
+      .toLocaleString('en', { month: 'short' })
+      .toUpperCase();
+    const yearShort = period.slice(2, 4);
+    const prefix = `${monthAbbr}${yearShort}`;
+
+    // Deactivate all currently active codes
+    await client.query(
+      `UPDATE promo_codes
+       SET is_active = false, deactivated_at = now()
+       WHERE is_active = true`
+    );
+
+    // Generate for every approved, active marketer
+    const marketers = await client.query(
+      `SELECT id, referral_code FROM marketers
+       WHERE is_approved = true AND is_active = true`
+    );
+
+    const created = [];
+    for (const m of marketers.rows) {
+      const code = `${prefix}-${m.referral_code}`.toUpperCase();
+      const ins = await client.query(
+        `INSERT INTO promo_codes (marketer_id, code, period, applies_to, is_active)
+         VALUES ($1, $2, $3, 'both', true)
+         ON CONFLICT (marketer_id, period) DO UPDATE SET
+           code = EXCLUDED.code,
+           is_active = true,
+           deactivated_at = NULL
+         RETURNING code, period`,
+        [m.id, code, period]
+      );
+      created.push(ins.rows[0]);
+    }
+
+    await client.query('COMMIT');
+    res.json({ period, count: created.length, codes: created });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Rotate promo codes error:', err);
+    res.status(500).json({ error: 'Rotation failed', detail: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ============================================================
 // ADMIN — COMMISSIONS
 // ============================================================
 router.get('/admin/commissions', isAdmin, async (req, res) => {
@@ -460,11 +523,11 @@ router.get('/admin/commissions', isAdmin, async (req, res) => {
     const { rows } = await pool.query(
       `SELECT c.id, c.amount, c.status, c.created_at, c.approved_at,
               m.full_name AS marketer_name, m.phone_number AS marketer_phone,
-              u.full_name AS customer_name, c.order_id
+              u.full_name AS user_name, r.user_type, c.order_id
        FROM marketer_commissions c
        JOIN marketers m ON m.id = c.marketer_id
        JOIN marketer_registrations r ON r.id = c.registration_id
-       JOIN users u ON u.id = r.customer_id
+       JOIN users u ON u.id = r.user_id
        ${where}
        ORDER BY c.created_at DESC`,
       params
@@ -546,29 +609,29 @@ router.put('/admin/withdrawals/:id/process', isAdmin, async (req, res) => {
       return res.status(400).json({ error: 'Withdrawal already finalized' });
     }
 
-    const updates = { status, admin_notes: admin_notes || null };
-    let sql = `UPDATE marketer_withdrawals
-               SET status = $1, admin_notes = $2, processed_at = now()
-               WHERE id = $3 RETURNING *`;
-    const params = [updates.status, updates.admin_notes, req.params.id];
-
     if (status === 'paid') {
-      sql = `UPDATE marketer_withdrawals
-             SET status = 'paid', admin_notes = $1, processed_at = now(),
-                 paid_at = now()
-             WHERE id = $2 RETURNING *`;
       await client.query(
         `UPDATE marketers SET total_withdrawn = total_withdrawn + $1,
            updated_at = now()
          WHERE id = $2`,
         [row.amount, row.marketer_id]
       );
-      const result = await client.query(sql, [admin_notes || null, req.params.id]);
+      const result = await client.query(
+        `UPDATE marketer_withdrawals
+         SET status = 'paid', admin_notes = $1, processed_at = now(), paid_at = now()
+         WHERE id = $2 RETURNING *`,
+        [admin_notes || null, req.params.id]
+      );
       await client.query('COMMIT');
       return res.json(result.rows[0]);
     }
 
-    const result = await client.query(sql, params);
+    const result = await client.query(
+      `UPDATE marketer_withdrawals
+       SET status = $1, admin_notes = $2, processed_at = now()
+       WHERE id = $3 RETURNING *`,
+      [status, admin_notes || null, req.params.id]
+    );
     await client.query('COMMIT');
     res.json(result.rows[0]);
   } catch (err) {

@@ -28,14 +28,21 @@ router.post('/order-call/token', authenticate, async (req, res) => {
     if (!order_id) return res.status(400).json({ error: 'order_id is required' });
 
     const orderRes = await pool.query(
-      `SELECT id, customer_id, agent_id, order_number
+      `SELECT id, customer_id, agent_id, order_number, status
        FROM orders WHERE id = $1`,
       [order_id]
     );
 
     if (orderRes.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
-
     const order = orderRes.rows[0];
+
+    // ── PREVENT CALLING IF AGENT HASN'T ACCEPTED ──
+    if (!['accepted', 'out_for_delivery', 'delivered'].includes(order.status)) {
+      return res.status(403).json({ 
+        error: 'You can only call after the agent accepts the order.' 
+      });
+    }
+
     const isCustomer = order.customer_id === userId;
     const isAgent = order.agent_id === userId;
 
@@ -99,11 +106,11 @@ router.post('/order-call/:orderId/ring', authenticate, async (req, res) => {
     const { orderId } = req.params;
 
     const orderRes = await pool.query(
-      `SELECT o.id, o.customer_id, o.agent_id, o.order_number,
-              cu.full_name AS customer_name, au.full_name AS agent_name
+      `SELECT o.id, o.customer_id, o.agent_id, o.order_number, o.status,
+              cu.full_name AS customer_name, au.business_name AS agent_name
        FROM orders o
        LEFT JOIN users cu ON cu.id = o.customer_id
-       LEFT JOIN users au ON au.id = o.agent_id
+       LEFT JOIN agents au ON au.id = o.agent_id
        WHERE o.id = $1`,
       [orderId]
     );
@@ -118,9 +125,17 @@ router.post('/order-call/:orderId/ring', authenticate, async (req, res) => {
       return res.status(403).json({ error: 'You are not a party to this order' });
     }
 
+    // ── PREVENT CALLING IF AGENT HASN'T ACCEPTED ──
+    if (!['accepted', 'out_for_delivery', 'delivered'].includes(order.status)) {
+      return res.status(403).json({ 
+        error: 'You can only call after the agent accepts the order.' 
+      });
+    }
+
     const calleeId = isCustomer ? order.agent_id : order.customer_id;
     if (!calleeId) return res.status(400).json({ error: 'Order has no counterparty yet' });
 
+    // Show Customer Name to Agent, and Business Name to Customer
     const callerName = isCustomer ? order.customer_name : order.agent_name;
 
     // ── TRIGGER THE FULL-SCREEN CALL PUSH ──
@@ -128,10 +143,10 @@ router.post('/order-call/:orderId/ring', authenticate, async (req, res) => {
       title: 'Incoming Call',
       body: `${callerName} is calling you`,
       data: {
-        type: 'incoming_call',             // Tells the app to show the call screen
+        type: 'incoming_call',             
         orderId: orderId,
-        channelName: `order:${orderId}`,   // Matches the Agora channel
-        callerName: callerName,
+        channelName: `order:${orderId}`,   
+        callerName: callerName,            // 👈 Name will show on native UI
       },
     });
 

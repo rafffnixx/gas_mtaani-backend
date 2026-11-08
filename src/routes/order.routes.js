@@ -9,7 +9,7 @@ const {
   clearAllTimers,
   scheduleSearchTimeout,
 } = require('../services/orderSearch');
-const { processFirstOrderCommission } = require('../services/marketerCommission');   // ── NEW
+const { processFirstOrderCommission } = require('../services/marketerCommission');
 
 // =====================================================
 // CREATE ORDER (Customer)
@@ -408,7 +408,7 @@ router.put(
 );
 
 // =====================================================
-// MARK AS DELIVERED (Agent) — now wraps commission hook
+// MARK AS DELIVERED (Agent) — wraps commission hook safely
 // =====================================================
 router.put('/:orderId/deliver', authenticate, isAgent, async (req, res) => {
   const client = await pool.connect();
@@ -437,9 +437,18 @@ router.put('/:orderId/deliver', authenticate, isAgent, async (req, res) => {
 
     const order = result.rows[0];
 
-    // ── NEW: marketer commission on first delivered order ──
-    await processFirstOrderCommission(client, order.id, order.customer_id);
-    // ───────────────────────────────────────────────────────
+    // ── Marketer commission on first delivered order ──
+    // Wrapped in try/catch so a commission error NEVER blocks the delivery.
+    if (order.customer_id) {
+      try {
+        await processFirstOrderCommission(client, order.id, order.customer_id);
+      } catch (commErr) {
+        console.warn('⚠️ Marketer commission failed (non-blocking):', commErr.message);
+      }
+    } else {
+      console.warn('⚠️ Skipping commission: order.customer_id is missing');
+    }
+    // ─────────────────────────────────────────────────
 
     await client.query('COMMIT');
 
@@ -715,8 +724,6 @@ router.put('/:orderId/collect-cash', authenticate, isAgent, async (req, res) => 
     const netFromItems = itemsTotal - commission;
     const netAmount = netFromItems + extendedFee;
 
-    // ── Wallet: cash order, agent already has the money → they owe commission.
-    //    Debit the wallet by the commission only.
     await client.query(
       `UPDATE agents
        SET current_order_count = GREATEST(0, current_order_count - 1),
@@ -842,7 +849,6 @@ router.put(
       const netFromItems = itemsTotal - commission;
       const netAmount = netFromItems + extendedFee;
 
-      // ── Wallet: online order, agent earns the net amount.
       await client.query(
         `UPDATE agents
          SET current_order_count = GREATEST(0, current_order_count - 1),

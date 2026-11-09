@@ -135,6 +135,54 @@ app.use('/api/admin',     adminRoutes);
 app.use('/api/payments',  paymentRoutes);
 app.use('/api/marketers', marketerRoutes);
 
+// ============================================
+// TEMPORARY: SMTP Connectivity Test
+// ============================================
+app.get('/api/smtp-test', async (req, res) => {
+  const net = require('net');
+  const dns = require('dns').promises;
+
+  const testPort = (host, port, timeoutMs = 10000) => new Promise((resolve) => {
+    const socket = new net.Socket();
+    const timer = setTimeout(() => {
+      socket.destroy();
+      resolve({ ok: false, error: 'TIMEOUT' });
+    }, timeoutMs);
+    socket.on('connect', () => {
+      clearTimeout(timer);
+      socket.destroy();
+      resolve({ ok: true });
+    });
+    socket.on('error', (err) => {
+      clearTimeout(timer);
+      resolve({ ok: false, error: err.code || err.message });
+    });
+    socket.connect(port, host);
+  });
+
+  try {
+    const host = process.env.SMTP_HOST || 'mail.raffcodes.tech';
+    const port = parseInt(process.env.SMTP_PORT || '465', 10);
+
+    const dnsResult = await dns.lookup(host, { all: true });
+
+    res.json({
+      config: {
+        smtp_host: host,
+        smtp_port: port,
+        smtp_user: process.env.SMTP_USER || '(not set)',
+        email_from: process.env.EMAIL_FROM || '(not set)',
+      },
+      dns_resolved_to: dnsResult.map(a => a.address),
+      port_465_test: await testPort(host, 465),
+      port_587_test: await testPort(host, 587),
+      port_25_test: await testPort(host, 25),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, stack: err.stack });
+  }
+});
+
 
 // ============================================
 // Health check

@@ -51,6 +51,18 @@ router.post('/order-call/token', authenticate, async (req, res) => {
     }
 
     const calleeId = isCustomer ? order.agent_id : order.customer_id;
+
+    // ── CHECK BUSY STATUS (PREVENT CONCURRENT CALLS) ──
+    const busyRes = await pool.query(
+      `SELECT id FROM call_logs 
+       WHERE (caller_id = $1 OR callee_id = $1 OR caller_id = $2 OR callee_id = $2)
+         AND status IN ('initiated', 'answered')
+         AND created_at > NOW() - INTERVAL '2 minutes'`,
+      [userId, calleeId]
+    );
+    if (busyRes.rows.length > 0) {
+      return res.status(409).json({ error: 'User is currently on another call.' });
+    }
     
     // ── CHECK CALLEE STATUS ──
     let isCalleeOnline = false;
@@ -134,6 +146,18 @@ router.post('/order-call/:orderId/ring', authenticate, async (req, res) => {
 
     const calleeId = isCustomer ? order.agent_id : order.customer_id;
     if (!calleeId) return res.status(400).json({ error: 'Order has no counterparty yet' });
+
+    // ── CHECK BUSY STATUS (PREVENT CONCURRENT CALLS) ──
+    const busyRes = await pool.query(
+      `SELECT id FROM call_logs 
+       WHERE (caller_id = $1 OR callee_id = $1 OR caller_id = $2 OR callee_id = $2)
+         AND status IN ('initiated', 'answered')
+         AND created_at > NOW() - INTERVAL '2 minutes'`,
+      [userId, calleeId]
+    );
+    if (busyRes.rows.length > 0) {
+      return res.status(409).json({ error: 'User is currently on another call.' });
+    }
 
     // Show Customer Name to Agent, and Business Name to Customer
     const callerName = isCustomer ? order.customer_name : order.agent_name;

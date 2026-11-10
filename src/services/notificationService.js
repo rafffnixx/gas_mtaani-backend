@@ -8,8 +8,6 @@ const { sendPushToUser } = require('./pushService');
 
 // The `type` column has a CHECK constraint:
 //   type IN ('order', 'payment', 'system', 'promotion')
-// Specific event names (order_accepted, payment_received, etc.) live inside
-// the `data` jsonb as data.event.
 function typeForEvent(eventType) {
   if (!eventType) return 'system';
   if (eventType.startsWith('order')) return 'order';
@@ -21,30 +19,64 @@ function typeForEvent(eventType) {
 }
 
 // --------------------------------------------------
-// Order event → chat thread system message
+// Order event → chat thread system messages
+// Separated for CUSTOMER and AGENT
 // --------------------------------------------------
 const ORDER_EVENT_MESSAGES = {
-  pending:         'Order placed — finding a partner',
-  searching:       'Searching for the nearest partner',
-  assigned:        'You received a new order to deliver',
-  accepted:        'Agent accepted the order',
-  out_for_delivery:'Your order is on the way',
-  delivered:       'Order delivered — please confirm receipt',
-  confirmed:       'Customer confirmed receipt',
-  paid:            'Payment received — order closed',
-  cash_collected:  'Cash received — order closed',
-  cancelled:       'Order cancelled',
-  declined:        'Agent declined the order',
+  pending: {
+    customer: 'Order placed — searching for a partner',
+    agent: 'Order searching for a partner',
+  },
+  searching: {
+    customer: 'Searching for the nearest partner...',
+    agent: 'Searching for a partner in your area...',
+  },
+  assigned: {
+    customer: 'A partner has been assigned and is reviewing your order.',
+    agent: 'You received a new order to deliver. Tap to accept.',
+  },
+  accepted: {
+    customer: 'Your partner accepted the order and is preparing.',
+    agent: 'You accepted the order. Start delivery when ready.',
+  },
+  out_for_delivery: {
+    customer: 'Your order is on the way!',
+    agent: 'You are out for delivery.',
+  },
+  delivered: {
+    customer: 'Order delivered — please confirm receipt.',
+    agent: 'You marked the order delivered. Waiting for customer confirmation.',
+  },
+  confirmed: {
+    customer: 'You confirmed receipt. Complete payment to close.',
+    agent: 'Customer confirmed receipt. Collect payment to close.',
+  },
+  paid: {
+    customer: 'Payment received. Order closed. Thank you!',
+    agent: 'Payment confirmed. Order closed. Earnings added.',
+  },
+  cash_collected: {
+    customer: 'Cash received. Order closed. Thank you!',
+    agent: 'Cash collected. Order closed. Earnings added.',
+  },
+  cancelled: {
+    customer: 'Order cancelled.',
+    agent: 'Order cancelled by customer.',
+  },
+  declined: {
+    customer: 'The partner declined. Finding another...',
+    agent: 'You declined this order.',
+  },
 };
 
 /**
- * Append a system message to the order's chat thread.
- * Silent no-op if the thread doesn't exist or the status is unknown.
+ * Append system messages to the order's chat thread for BOTH parties.
+ * Inserts two distinct messages with sender_role 'system_customer' and 'system_agent'.
  */
 async function appendOrderChatMessage(order, status, { client = null } = {}) {
   if (!order?.id) return;
-  const body = ORDER_EVENT_MESSAGES[status];
-  if (!body) return;
+  const msgs = ORDER_EVENT_MESSAGES[status];
+  if (!msgs) return;
 
   const runner = client || pool;
   try {
@@ -57,22 +89,34 @@ async function appendOrderChatMessage(order, status, { client = null } = {}) {
 
     const threadId = threadRes.rows[0].id;
 
-    // Insert the system message
-    await runner.query(
-      `INSERT INTO chat_messages
-         (thread_id, sender_id, sender_role, body, created_at)
-       VALUES ($1, NULL, 'system', $2, NOW())`,
-      [threadId, body]
-    );
+    // Insert the CUSTOMER message
+    if (msgs.customer) {
+      await runner.query(
+        `INSERT INTO chat_messages
+           (thread_id, sender_id, sender_role, body, created_at)
+         VALUES ($1, NULL, 'system_customer', $2, NOW())`,
+        [threadId, msgs.customer]
+      );
+    }
 
-    // Update the thread's last-message fields
+    // Insert the AGENT message
+    if (msgs.agent) {
+      await runner.query(
+        `INSERT INTO chat_messages
+           (thread_id, sender_id, sender_role, body, created_at)
+         VALUES ($1, NULL, 'system_agent', $2, NOW())`,
+        [threadId, msgs.agent]
+      );
+    }
+
+    // Update the thread's last-message preview (use the customer's text as default)
     await runner.query(
       `UPDATE chat_threads
        SET last_message_at = NOW(),
            last_message_preview = LEFT($1, 200),
            updated_at = NOW()
        WHERE id = $2`,
-      [body, threadId]
+      [msgs.customer || msgs.agent, threadId]
     );
   } catch (err) {
     // Best-effort — never crash the caller
@@ -212,7 +256,7 @@ async function notifyOrderEvent(order, status, opts = {}) {
     });
   }
 
-  // ---- Append a system message to the order's chat thread ----
+  // ---- Append system messages to the order's chat thread ----
   await appendOrderChatMessage(order, status, { client });
 }
 

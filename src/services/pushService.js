@@ -1,12 +1,12 @@
 // 📁 backend/src/services/pushService.js
-// Sends Expo push notifications for a given user.
-
 const { pool } = require('../config/database');
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 
 /**
- * Send a push to one user (looks up their expo_push_token).
+ * Send a push to one user.
+ * Routes calls to the 'incoming-call' channel (MAX priority)
+ * and normal messages to the 'default' channel (HIGH priority).
  *
  * @param {string} userId
  * @param {object} payload
@@ -35,9 +35,9 @@ async function sendPushToUser(userId, { title, body, data = {} }) {
       body,
       data,
       priority: 'high',
-      // If it's a call, use the high-priority channel and category. Otherwise, default.
+      // If it's a call, use the high-priority channel and category.
       channelId: isCall ? 'incoming-call' : 'default',
-      ...(isCall && { categoryId: 'incoming_call' }), 
+      ...(isCall && { categoryId: 'incoming_call' }),
     };
 
     const res = await fetch(EXPO_PUSH_URL, {
@@ -53,7 +53,7 @@ async function sendPushToUser(userId, { title, body, data = {} }) {
     const result = await res.json().catch(() => null);
 
     // If the token is dead, clear it
-    const ticket = result?.data?.[0]; // Expo returns an array
+    const ticket = result?.data?.[0];
     if (ticket?.status === 'error') {
       const errCode = ticket?.details?.error;
       if (errCode === 'DeviceNotRegistered') {

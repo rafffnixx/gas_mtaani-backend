@@ -65,8 +65,7 @@ async function appendOrderChatMessage(order, status, { client = null } = {}) {
       [threadId, body]
     );
 
-    // Update the thread's last-message fields so it surfaces at the top
-    // of the thread list
+    // Update the thread's last-message fields
     await runner.query(
       `UPDATE chat_threads
        SET last_message_at = NOW(),
@@ -83,16 +82,6 @@ async function appendOrderChatMessage(order, status, { client = null } = {}) {
 
 /**
  * Create a notification, then fire a push for it.
- *
- * @param {object} opts
- * @param {string} opts.userId
- * @param {string} opts.eventType       e.g. 'order_status'
- * @param {string} opts.templateKey     e.g. 'order_status_customer'
- * @param {object} [opts.ctx]           variables passed to the template
- * @param {string} [opts.groupKey]      e.g. 'order:<uuid>'
- * @param {object} [opts.payloadOverride] force a specific payload
- * @param {object} [opts.client]        optional pg client (for transactions)
- * @param {boolean} [opts.skipPush]     set true to skip push (e.g. bulk backfill)
  */
 async function createNotification({
   userId,
@@ -187,12 +176,6 @@ async function createNotificationForMany({ userIds, ...rest }) {
 /**
  * Fire the correct notification(s) for an order event, AND append a system
  * message to the order's chat thread so the thread shows the full timeline.
- *
- * Called from every route that changes order status.
- *
- * @param {object} order   full order row (id, order_number, customer_id, agent_id)
- * @param {string} status  new status
- * @param {object} [opts]  { client } for transaction safety
  */
 async function notifyOrderEvent(order, status, opts = {}) {
   if (!order || !order.id) return;
@@ -218,7 +201,6 @@ async function notifyOrderEvent(order, status, opts = {}) {
   }
 
   // ---- Agent notification ----
-  // agents.id === users.id, so use order.agent_id directly. No lookup needed.
   if (order.agent_id) {
     await createNotification({
       userId: order.agent_id,
@@ -231,7 +213,6 @@ async function notifyOrderEvent(order, status, opts = {}) {
   }
 
   // ---- Append a system message to the order's chat thread ----
-  // One message per event, seen by both parties (same thread).
   await appendOrderChatMessage(order, status, { client });
 }
 
@@ -298,7 +279,6 @@ async function markAllRead(userId) {
 
 /**
  * Mark every notification in a group as read
- * (e.g. when the user opens a specific chat thread).
  */
 async function markGroupRead(userId, groupKey) {
   if (!groupKey) return;

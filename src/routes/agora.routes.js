@@ -52,12 +52,21 @@ router.post('/order-call/token', authenticate, async (req, res) => {
 
     const calleeId = isCustomer ? order.agent_id : order.customer_id;
 
+    // ── AUTO-CLEANUP ORPHANED CALLS ──
+    // If a call was initiated > 1 minute ago and never ended, kill it so it doesn't block new calls.
+    await pool.query(
+      `UPDATE call_logs 
+       SET status = 'ended', ended_at = NOW() 
+       WHERE status IN ('initiated', 'answered') 
+         AND created_at < NOW() - INTERVAL '1 minute'`
+    );
+
     // ── CHECK BUSY STATUS (PREVENT CONCURRENT CALLS) ──
     const busyRes = await pool.query(
       `SELECT id FROM call_logs 
        WHERE (caller_id = $1 OR callee_id = $1 OR caller_id = $2 OR callee_id = $2)
          AND status IN ('initiated', 'answered')
-         AND created_at > NOW() - INTERVAL '2 minutes'`,
+         AND created_at > NOW() - INTERVAL '45 seconds'`, // Reduced from 2 minutes to 45 seconds
       [userId, calleeId]
     );
     if (busyRes.rows.length > 0) {
@@ -147,12 +156,20 @@ router.post('/order-call/:orderId/ring', authenticate, async (req, res) => {
     const calleeId = isCustomer ? order.agent_id : order.customer_id;
     if (!calleeId) return res.status(400).json({ error: 'Order has no counterparty yet' });
 
+    // ── AUTO-CLEANUP ORPHANED CALLS ──
+    await pool.query(
+      `UPDATE call_logs 
+       SET status = 'ended', ended_at = NOW() 
+       WHERE status IN ('initiated', 'answered') 
+         AND created_at < NOW() - INTERVAL '1 minute'`
+    );
+
     // ── CHECK BUSY STATUS (PREVENT CONCURRENT CALLS) ──
     const busyRes = await pool.query(
       `SELECT id FROM call_logs 
        WHERE (caller_id = $1 OR callee_id = $1 OR caller_id = $2 OR callee_id = $2)
          AND status IN ('initiated', 'answered')
-         AND created_at > NOW() - INTERVAL '2 minutes'`,
+         AND created_at > NOW() - INTERVAL '45 seconds'`, // Reduced from 2 minutes to 45 seconds
       [userId, calleeId]
     );
     if (busyRes.rows.length > 0) {

@@ -18,7 +18,7 @@ router.get('/app-id', (req, res) => {
 });
 
 // =====================================================
-// ORDER CALL TOKEN
+// ORDER CALLS (Customer <-> Agent)
 // =====================================================
 router.post('/order-call/token', authenticate, async (req, res) => {
   try {
@@ -36,52 +36,34 @@ router.post('/order-call/token', authenticate, async (req, res) => {
     if (orderRes.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
     const order = orderRes.rows[0];
 
-    // ── PREVENT CALLING IF AGENT HASN'T ACCEPTED ──
     if (!['accepted', 'out_for_delivery', 'delivered'].includes(order.status)) {
-      return res.status(403).json({ 
-        error: 'You can only call after the agent accepts the order.' 
-      });
+      return res.status(403).json({ error: 'You can only call after the agent accepts the order.' });
     }
 
     const isCustomer = order.customer_id === userId;
     const isAgent = order.agent_id === userId;
-
-    if (!isCustomer && !isAgent) {
-      return res.status(403).json({ error: 'You are not a party to this order' });
-    }
+    if (!isCustomer && !isAgent) return res.status(403).json({ error: 'You are not a party to this order' });
 
     const calleeId = isCustomer ? order.agent_id : order.customer_id;
 
-    // ── AUTO-CLEANUP ORPHANED CALLS ──
-    // If a call was initiated > 1 minute ago and never ended, kill it so it doesn't block new calls.
+    // Auto-cleanup stuck calls older than 1 minute
     await pool.query(
-      `UPDATE call_logs 
-       SET status = 'ended', ended_at = NOW() 
-       WHERE status IN ('initiated', 'answered') 
-         AND created_at < NOW() - INTERVAL '1 minute'`
+      `UPDATE call_logs SET status = 'ended', ended_at = NOW() 
+       WHERE status IN ('initiated', 'answered') AND created_at < NOW() - INTERVAL '1 minute'`
     );
 
-    // ── CHECK BUSY STATUS (PREVENT CONCURRENT CALLS) ──
     const busyRes = await pool.query(
       `SELECT id FROM call_logs 
        WHERE (caller_id = $1 OR callee_id = $1 OR caller_id = $2 OR callee_id = $2)
-         AND status IN ('initiated', 'answered')
-         AND created_at > NOW() - INTERVAL '45 seconds'`, // Reduced from 2 minutes to 45 seconds
+         AND status IN ('initiated', 'answered') AND created_at > NOW() - INTERVAL '45 seconds'`,
       [userId, calleeId]
     );
-    if (busyRes.rows.length > 0) {
-      return res.status(409).json({ error: 'User is currently on another call.' });
-    }
-    
-    // ── CHECK CALLEE STATUS ──
+    if (busyRes.rows.length > 0) return res.status(409).json({ error: 'User is currently on another call.' });
+
     let isCalleeOnline = false;
     let statusText = 'Calling...';
-
     if (calleeId) {
-      const calleeRes = await pool.query(
-        `SELECT is_online FROM agents WHERE id = $1`,
-        [calleeId]
-      );
+      const calleeRes = await pool.query(`SELECT is_online FROM agents WHERE id = $1`, [calleeId]);
       if (calleeRes.rows.length > 0) {
         isCalleeOnline = calleeRes.rows[0].is_online;
         statusText = isCalleeOnline ? 'Ringing...' : 'Calling...';
@@ -92,11 +74,8 @@ router.post('/order-call/token', authenticate, async (req, res) => {
     const uid = Math.floor(Math.random() * 1000000) + 1000;
     const token = generateToken(channelName, uid, 3600);
 
-    // ── LOG THE CALL ──
     const logRes = await pool.query(
-      `INSERT INTO call_logs (caller_id, callee_id, order_id, status)
-       VALUES ($1, $2, $3, 'initiated')
-       RETURNING id`,
+      `INSERT INTO call_logs (caller_id, callee_id, order_id, status) VALUES ($1, $2, $3, 'initiated') RETURNING id`,
       [userId, calleeId, order_id]
     );
 
@@ -118,9 +97,6 @@ router.post('/order-call/token', authenticate, async (req, res) => {
   }
 });
 
-// =====================================================
-// RING THE OTHER PARTY ON AN ORDER
-// =====================================================
 router.post('/order-call/:orderId/ring', authenticate, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -141,61 +117,43 @@ router.post('/order-call/:orderId/ring', authenticate, async (req, res) => {
     const order = orderRes.rows[0];
     const isCustomer = order.customer_id === userId;
     const isAgent = order.agent_id === userId;
+    if (!isCustomer && !isAgent) return res.status(403).json({ error: 'You are not a party to this order' });
 
-    if (!isCustomer && !isAgent) {
-      return res.status(403).json({ error: 'You are not a party to this order' });
-    }
-
-    // ── PREVENT CALLING IF AGENT HASN'T ACCEPTED ──
     if (!['accepted', 'out_for_delivery', 'delivered'].includes(order.status)) {
-      return res.status(403).json({ 
-        error: 'You can only call after the agent accepts the order.' 
-      });
+      return res.status(403).json({ error: 'You can only call after the agent accepts the order.' });
     }
 
     const calleeId = isCustomer ? order.agent_id : order.customer_id;
     if (!calleeId) return res.status(400).json({ error: 'Order has no counterparty yet' });
 
-    // ── AUTO-CLEANUP ORPHANED CALLS ──
     await pool.query(
-      `UPDATE call_logs 
-       SET status = 'ended', ended_at = NOW() 
-       WHERE status IN ('initiated', 'answered') 
-         AND created_at < NOW() - INTERVAL '1 minute'`
+      `UPDATE call_logs SET status = 'ended', ended_at = NOW() 
+       WHERE status IN ('initiated', 'answered') AND created_at < NOW() - INTERVAL '1 minute'`
     );
 
-    // ── CHECK BUSY STATUS (PREVENT CONCURRENT CALLS) ──
     const busyRes = await pool.query(
       `SELECT id FROM call_logs 
        WHERE (caller_id = $1 OR callee_id = $1 OR caller_id = $2 OR callee_id = $2)
-         AND status IN ('initiated', 'answered')
-         AND created_at > NOW() - INTERVAL '45 seconds'`, // Reduced from 2 minutes to 45 seconds
+         AND status IN ('initiated', 'answered') AND created_at > NOW() - INTERVAL '45 seconds'`,
       [userId, calleeId]
     );
-    if (busyRes.rows.length > 0) {
-      return res.status(409).json({ error: 'User is currently on another call.' });
-    }
+    if (busyRes.rows.length > 0) return res.status(409).json({ error: 'User is currently on another call.' });
 
-    // ── LOG THE CALL FIRST SO WE HAVE A UNIQUE ID ──
     const logRes = await pool.query(
-      `INSERT INTO call_logs (caller_id, callee_id, order_id, status)
-       VALUES ($1, $2, $3, 'initiated')
-       RETURNING id`,
+      `INSERT INTO call_logs (caller_id, callee_id, order_id, status) VALUES ($1, $2, $3, 'initiated') RETURNING id`,
       [userId, calleeId, orderId]
     );
     const callLogId = logRes.rows[0].id;
 
-    // Show Customer Name to Agent, and Business Name to Customer
     const callerName = isCustomer ? order.customer_name : order.agent_name;
 
-    // ── TRIGGER THE FULL-SCREEN CALL PUSH ──
     const result = await sendPushToUser(calleeId, {
       title: 'Incoming Call',
       body: `${callerName} is calling you`,
       data: {
         type: 'incoming_call',             
         orderId: orderId,
-        callLogId: callLogId,               // 👈 CRITICAL FIX: Send the unique UUID
+        callLogId: callLogId,               
         channelName: `order:${orderId}`,   
         callerName: callerName,            
       },
@@ -212,21 +170,15 @@ router.post('/order-call/:orderId/ring', authenticate, async (req, res) => {
   }
 });
 
-// =====================================================
-// END CALL (Update duration)
-// =====================================================
 router.post('/call/:logId/end', authenticate, async (req, res) => {
   try {
     const { logId } = req.params;
     const { duration_seconds } = req.body;
 
     await pool.query(
-      `UPDATE call_logs
-       SET status = 'ended', duration_seconds = $1, ended_at = NOW()
-       WHERE id = $2`,
+      `UPDATE call_logs SET status = 'ended', duration_seconds = $1, ended_at = NOW() WHERE id = $2`,
       [duration_seconds || 0, logId]
     );
-
     res.json({ success: true });
   } catch (error) {
     console.error('End call error:', error);
@@ -235,34 +187,7 @@ router.post('/call/:logId/end', authenticate, async (req, res) => {
 });
 
 // =====================================================
-// CALL HISTORY
-// =====================================================
-router.get('/history', authenticate, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const result = await pool.query(
-      `SELECT c.*, 
-              o.order_number,
-              u1.full_name AS caller_name,
-              u2.full_name AS callee_name
-       FROM call_logs c
-       LEFT JOIN orders o ON c.order_id = o.id
-       LEFT JOIN users u1 ON c.caller_id = u1.id
-       LEFT JOIN users u2 ON c.callee_id = u2.id
-       WHERE c.caller_id = $1 OR c.callee_id = $1
-       ORDER BY c.created_at DESC
-       LIMIT 50`,
-      [userId]
-    );
-    res.json(result.rows);
-  } catch (error) {
-    console.error('Call history error:', error);
-    res.status(500).json({ error: 'Failed to fetch call history' });
-  }
-});
-
-// =====================================================
-// SUPPORT CALLS
+// SUPPORT CALLS (Customer/Agent -> Admin Web)
 // =====================================================
 router.post('/support-call/token', authenticate, async (req, res) => {
   try {
@@ -289,6 +214,15 @@ router.post('/support-call/token', authenticate, async (req, res) => {
       `UPDATE support_calls SET channel_name = $1 WHERE id = $2`,
       [channelName, callId]
     );
+
+    // 🔔 RING ALL ADMINS INSTANTLY VIA SOCKET.IO
+    if (global.io) {
+      global.io.to('admins').emit('incoming_call', {
+        callId,
+        callerName: req.user.full_name || 'User',
+        callerType: userType,
+      });
+    }
 
     res.json({
       success: true,
@@ -345,11 +279,21 @@ router.post('/support-calls/:callId/answer', authenticate, async (req, res) => {
     const token = generateToken(call.channel_name, uid, 3600);
 
     await pool.query(
-      `UPDATE support_calls
-       SET status = 'answered', admin_id = $1, answered_at = NOW()
-       WHERE id = $2`,
+      `UPDATE support_calls SET status = 'answered', admin_id = $1, answered_at = NOW() WHERE id = $2`,
       [adminId, callId]
     );
+
+    // Fetch Admin Name for the broadcast
+    const adminRes = await pool.query(`SELECT full_name FROM users WHERE id = $1`, [adminId]);
+    const adminName = adminRes.rows[0]?.full_name || 'Another Admin';
+
+    // 🛑 STOP RINGING ON OTHER DEVICES
+    if (global.io) {
+      global.io.to('admins').emit('call_answered_by_other', {
+        callId,
+        adminName: adminName,
+      });
+    }
 
     res.json({
       success: true,
@@ -360,6 +304,7 @@ router.post('/support-calls/:callId/answer', authenticate, async (req, res) => {
       expires_in: 3600,
     });
   } catch (error) {
+    console.error('Answer support call error:', error);
     res.status(500).json({ error: 'Failed to answer support call' });
   }
 });
@@ -369,15 +314,99 @@ router.post('/support-calls/:callId/end', authenticate, async (req, res) => {
     const { callId } = req.params;
 
     await pool.query(
-      `UPDATE support_calls
-       SET status = 'ended', ended_at = NOW()
-       WHERE id = $1 AND status IN ('ringing', 'answered')`,
+      `UPDATE support_calls SET status = 'ended', ended_at = NOW() WHERE id = $1 AND status IN ('ringing', 'answered')`,
       [callId]
     );
 
+    if (global.io) {
+      global.io.to('admins').emit('call_ended', { callId });
+    }
+
     res.json({ success: true });
   } catch (error) {
+    console.error('End support call error:', error);
     res.status(500).json({ error: 'Failed to end call' });
+  }
+});
+
+// =====================================================
+// ADMIN PROACTIVE CALL (Admin -> Customer/Agent)
+// =====================================================
+router.post('/admin-call/ring', authenticate, async (req, res) => {
+  try {
+    if (req.user.user_type !== 'admin') {
+      return res.status(403).json({ error: 'Admin only' });
+    }
+
+    const { target_user_id } = req.body; 
+    const adminId = req.user.id;
+
+    if (!target_user_id) return res.status(400).json({ error: 'target_user_id is required' });
+
+    const insertRes = await pool.query(
+      `INSERT INTO support_calls (admin_id, caller_type, target_user_id, status, channel_name)
+       VALUES ($1, 'admin', $2, 'ringing', 'pending')
+       RETURNING id`,
+      [adminId, target_user_id]
+    );
+
+    const callId = insertRes.rows[0].id;
+    const channelName = supportChannelName(callId);
+
+    await pool.query(
+      `UPDATE support_calls SET channel_name = $1 WHERE id = $2`,
+      [channelName, callId]
+    );
+
+    const result = await sendPushToUser(target_user_id, {
+      title: 'Incoming Support Call',
+      body: 'Gas Mtaani Support is calling you.',
+      data: {
+        type: 'incoming_call',
+        orderId: callId,           
+        callLogId: callId,         
+        channelName: channelName,
+        callerName: 'Gas Mtaani Support',
+      },
+    });
+
+    res.json({
+      success: true,
+      message: 'Ringing user...',
+      push_sent: result?.data?.[0]?.status === 'ok',
+      call_id: callId,
+    });
+
+  } catch (error) {
+    console.error('Admin ring error:', error);
+    res.status(500).json({ error: 'Failed to ring user' });
+  }
+});
+
+// =====================================================
+// CALL HISTORY
+// =====================================================
+router.get('/history', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const result = await pool.query(
+      `SELECT c.*, 
+              o.order_number,
+              u1.full_name AS caller_name,
+              u2.full_name AS callee_name
+       FROM call_logs c
+       LEFT JOIN orders o ON c.order_id = o.id
+       LEFT JOIN users u1 ON c.caller_id = u1.id
+       LEFT JOIN users u2 ON c.callee_id = u2.id
+       WHERE c.caller_id = $1 OR c.callee_id = $1
+       ORDER BY c.created_at DESC
+       LIMIT 50`,
+      [userId]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Call history error:', error);
+    res.status(500).json({ error: 'Failed to fetch call history' });
   }
 });
 

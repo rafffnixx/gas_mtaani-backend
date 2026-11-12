@@ -343,11 +343,12 @@ router.post('/admin-call/ring', authenticate, async (req, res) => {
 
     if (!target_user_id) return res.status(400).json({ error: 'target_user_id is required' });
 
+    // 🛑 FIX: Set caller_id = adminId to satisfy the DB constraint
     const insertRes = await pool.query(
-      `INSERT INTO support_calls (admin_id, caller_type, target_user_id, status, channel_name)
-       VALUES ($1, 'admin', $2, 'ringing', 'pending')
+      `INSERT INTO support_calls (caller_id, admin_id, caller_type, target_user_id, status, channel_name)
+       VALUES ($1, $2, 'admin', $3, 'ringing', 'pending')
        RETURNING id`,
-      [adminId, target_user_id]
+      [adminId, adminId, target_user_id]
     );
 
     const callId = insertRes.rows[0].id;

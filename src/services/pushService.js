@@ -34,10 +34,13 @@ async function sendPushToUser(userId, { title, body, data = {} }) {
       title,
       body,
       data,
-      priority: 'high',
+      priority: isCall ? 'max' : 'high',
       // If it's a call, use the high-priority channel and category.
       channelId: isCall ? 'incoming-call' : 'default',
-      ...(isCall && { categoryId: 'incoming_call' }),
+      ...(isCall && { 
+        categoryId: 'incoming_call',
+        ttl: 60, // 60 seconds expiry so it doesn't get stuck in FCM buffer
+      }),
     };
 
     const res = await fetch(EXPO_PUSH_URL, {

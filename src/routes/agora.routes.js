@@ -176,6 +176,15 @@ router.post('/order-call/:orderId/ring', authenticate, async (req, res) => {
       return res.status(409).json({ error: 'User is currently on another call.' });
     }
 
+    // ── LOG THE CALL FIRST SO WE HAVE A UNIQUE ID ──
+    const logRes = await pool.query(
+      `INSERT INTO call_logs (caller_id, callee_id, order_id, status)
+       VALUES ($1, $2, $3, 'initiated')
+       RETURNING id`,
+      [userId, calleeId, orderId]
+    );
+    const callLogId = logRes.rows[0].id;
+
     // Show Customer Name to Agent, and Business Name to Customer
     const callerName = isCustomer ? order.customer_name : order.agent_name;
 
@@ -186,8 +195,9 @@ router.post('/order-call/:orderId/ring', authenticate, async (req, res) => {
       data: {
         type: 'incoming_call',             
         orderId: orderId,
+        callLogId: callLogId,               // 👈 CRITICAL FIX: Send the unique UUID
         channelName: `order:${orderId}`,   
-        callerName: callerName,            // 👈 Name will show on native UI
+        callerName: callerName,            
       },
     });
 

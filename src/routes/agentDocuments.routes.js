@@ -90,4 +90,31 @@ router.post('/upload-docs', authenticate, isAgent, upload.single('file'), async 
   }
 });
 
+// =====================================================
+// GET /api/agents/:agentId/documents (Admin Only)
+// Allows the Admin Web Portal to fetch documents for a specific agent.
+// =====================================================
+router.get('/:agentId/documents', authenticate, async (req, res) => {
+  try {
+    // Verify the requester is an admin
+    if (req.user.user_type !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    const { agentId } = req.params;
+    const result = await pool.query(
+      `SELECT id, document_type, url, uploaded_at
+       FROM agent_documents
+       WHERE agent_id = $1
+       ORDER BY uploaded_at DESC`,
+      [agentId]
+    );
+    
+    res.json(result.rows);
+  } catch (err) {
+    console.error('GET /agents/:agentId/documents error:', err);
+    res.status(500).json({ error: 'Failed to load agent documents' });
+  }
+});
+
 module.exports = router;

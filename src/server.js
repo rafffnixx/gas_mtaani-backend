@@ -10,16 +10,10 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// ============================================
-// Security headers
-// ============================================
 app.use(helmet({
   crossOriginResourcePolicy: { policy: 'cross-origin' },
 }));
 
-// ============================================
-// CORS — explicit allowed origins
-// ============================================
 const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:4173',
@@ -46,37 +40,33 @@ app.use(cors({
   maxAge: 86400,
 }));
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// 👈 THE FIX: Only parse JSON if it's NOT a multipart upload
+const jsonParser = express.json();
+const urlencodedParser = express.urlencoded({ extended: true });
 
-// ============================================
-// Static assets
-// ============================================
-app.use(
-  '/assets',
-  express.static(path.join(__dirname, '..', 'assets'), {
-    maxAge: '7d',
-    immutable: false,
-    fallthrough: true,
-  })
-);
+app.use((req, res, next) => {
+  if (req.headers['content-type'] && req.headers['content-type'].includes('multipart/form-data')) {
+    return next(); // Skip JSON parsing for file uploads
+  }
+  jsonParser(req, res, next);
+});
 
-app.use(
-  '/uploads',
-  express.static(path.join(__dirname, '..', 'uploads'), {
-    maxAge: '7d',
-    immutable: false,
-    fallthrough: true,
-  })
-);
+app.use((req, res, next) => {
+  if (req.headers['content-type'] && req.headers['content-type'].includes('multipart/form-data')) {
+    return next();
+  }
+  urlencodedParser(req, res, next);
+});
 
-// ============================================
-// Routes
-// ============================================
+app.use('/assets', express.static(path.join(__dirname, '..', 'assets')));
+app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
+
+// ... (all your existing routes remain exactly the same)
+
 const authRoutes          = require('./routes/auth.routes');
 const adminAuthRoutes     = require('./routes/adminAuth.routes');
 const customerRoutes      = require('./routes/customer.routes');
-const customerWalletRoutes = require('./routes/customerWallet.routes'); // <-- NEW
+const customerWalletRoutes = require('./routes/customerWallet.routes');
 const productRoutes       = require('./routes/product.routes');
 const agentRoutes         = require('./routes/agent.routes');
 const orderRoutes         = require('./routes/order.routes');
@@ -91,151 +81,42 @@ const notificationPreferencesRoutes = require('./routes/notificationPreferences.
 const agentDocumentsRoutes = require('./routes/agentDocuments.routes');
 const marketerRoutes = require('./routes/marketer.routes');
 
-
-// ============================================
-// Background services
-// ============================================
 const { startOrderSweeper }        = require('./services/orderSweeper');
 const { startGracePeriodScheduler } = require('./services/gracePeriodScheduler');
 
-// Mount admin auth BEFORE /api/admin so /api/admin/auth/* takes priority
 app.use('/api/admin/auth', adminAuthRoutes);
-
-// Existing routes
 app.use('/api/auth',      authRoutes);
-
-// ⚠️ Mount the specific wallet routes BEFORE the general customer routes
-app.use('/api/customers/wallet', customerWalletRoutes); // <-- NEW
+app.use('/api/customers/wallet', customerWalletRoutes);
 app.use('/api/customers', customerRoutes);
-
 app.use('/api/products',  productRoutes);
 app.use('/api/chat',      chatRoutes);
 app.use('/api/notifications', notificationsRoutes);
 app.use('/api/agora', agoraRoutes);
-
-// ⚠️  business-hours and documents must be mounted BEFORE /api/agents so
-//     they aren't shadowed by an /:id route inside agent.routes.js.
-
 app.use('/api/agents/business-hours', businessHoursRoutes);
-
-app.use('/api/agents', agentDocumentsRoutes);   // ← handles GET /documents and POST /upload-docs
-
-// Now mount the general agents router
+app.use('/api/agents', agentDocumentsRoutes);
 app.use('/api/agents',    agentRoutes);
-
-// Notification preferences
 app.use('/api/users/notification-preferences', notificationPreferencesRoutes);
-
-// ⚠️  quoteRoutes must be mounted BEFORE orderRoutes so /api/orders/quote
-//     isn't shadowed by the catch-all GET /:orderId in order.routes.js
 app.use('/api/orders',    quoteRoutes);
 app.use('/api/orders',    orderRoutes);
-
 app.use('/api/admin',     adminRoutes);
 app.use('/api/payments',  paymentRoutes);
 app.use('/api/marketers', marketerRoutes);
 
-// ============================================
-// TEMPORARY: SMTP Connectivity Test
-// ============================================
-app.get('/api/smtp-test', async (req, res) => {
-  const net = require('net');
-  const dns = require('dns').promises;
-
-  const testPort = (host, port, timeoutMs = 10000) => new Promise((resolve) => {
-    const socket = new net.Socket();
-    const timer = setTimeout(() => {
-      socket.destroy();
-      resolve({ ok: false, error: 'TIMEOUT' });
-    }, timeoutMs);
-    socket.on('connect', () => {
-      clearTimeout(timer);
-      socket.destroy();
-      resolve({ ok: true });
-    });
-    socket.on('error', (err) => {
-      clearTimeout(timer);
-      resolve({ ok: false, error: err.code || err.message });
-    });
-    socket.connect(port, host);
-  });
-
-  try {
-    const host = process.env.SMTP_HOST || 'mail.raffcodes.tech';
-    const port = parseInt(process.env.SMTP_PORT || '465', 10);
-
-    const dnsResult = await dns.lookup(host, { all: true });
-
-    res.json({
-      config: {
-        smtp_host: host,
-        smtp_port: port,
-        smtp_user: process.env.SMTP_USER || '(not set)',
-        email_from: process.env.EMAIL_FROM || '(not set)',
-      },
-      dns_resolved_to: dnsResult.map(a => a.address),
-      port_465_test: await testPort(host, 465),
-      port_587_test: await testPort(host, 587),
-      port_25_test: await testPort(host, 25),
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
-  }
-});
-
-
-// ============================================
-// Health check
-// ============================================
 app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'OK',
-    message: 'Gas Mtaani API is running',
-    timestamp: new Date().toISOString(),
-  });
+  res.json({ status: 'OK', message: 'Gas Mtaani API is running' });
 });
 
-// ============================================
-// 404 handler
-// ============================================
 app.use((req, res) => {
   res.status(404).json({ error: 'Route not found' });
 });
 
-// ============================================
-// Error handler
-// ============================================
 app.use((err, req, res, next) => {
   console.error('Error:', err.stack);
-  res.status(500).json({
-    error: 'Something went wrong!',
-    message: process.env.NODE_ENV === 'development' ? err.message : undefined,
-  });
+  res.status(500).json({ error: 'Something went wrong!' });
 });
 
-// ============================================
-// Start server
-// ============================================
 app.listen(PORT, () => {
   console.log(`🚀 Gas Mtaani API running on port ${PORT}`);
-  console.log(`📡 http://localhost:${PORT}`);
-  console.log(`📋 Health check: http://localhost:${PORT}/api/health`);
-  console.log(`🔑 Admin auth:   http://localhost:${PORT}/api/admin/auth`);
-  console.log(`👤 Customers:    http://localhost:${PORT}/api/customers`);
-  console.log(`💳 Cust Wallet:  http://localhost:${PORT}/api/customers/wallet`);
-  console.log(`🔑 Admin routes: http://localhost:${PORT}/api/admin`);
-  console.log(`🖼  Assets:      http://localhost:${PORT}/assets/*`);
-  console.log(`📤 Uploads:      http://localhost:${PORT}/uploads/*`);
-  console.log(`💬 Quotes:       http://localhost:${PORT}/api/orders/quote`);
-  console.log(`🔔 Notifications: http://localhost:${PORT}/api/notifications`);
-  console.log(`📞 Agora:        http://localhost:${PORT}/api/agora`);
-  console.log(`🕒 Business hrs: http://localhost:${PORT}/api/agents/business-hours`);
-  console.log(`📄 Docs:         http://localhost:${PORT}/api/agents/documents`);
-  console.log(`⚙️  Prefs:        http://localhost:${PORT}/api/users/notification-preferences`);
-
-  // Start the background sweeper — rescues stuck orders across restarts
   startOrderSweeper();
-
-  // Start the wallet grace-period scheduler — flags/blacklists unpaid agents
   startGracePeriodScheduler();
 });

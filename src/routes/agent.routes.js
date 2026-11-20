@@ -1,4 +1,4 @@
-// 📁 backend/routes/agent.routes.js
+// 📁 backend/src/routes/agent.routes.js
 const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/database');
@@ -109,7 +109,6 @@ router.get('/wallet', authenticate, isAgent, async (req, res) => {
   }
 });
 
-// ── UPDATED: JOIN WITH ORDERS ──
 router.get('/wallet/ledger', authenticate, isAgent, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit) || 50, 200);
@@ -137,7 +136,6 @@ router.get('/wallet/ledger', authenticate, isAgent, async (req, res) => {
   }
 });
 
-// Settle — for cash agents paying commission back to the platform.
 // ================================================================
 // SETTLE COMMISSION VIA PESAPAL
 // ================================================================
@@ -324,12 +322,10 @@ router.get('/location', authenticate, isAgent, async (req, res) => {
   }
 });
 
+// 👈 UPDATED: DECODE GPS TO WORDS ON THE BACKEND
 router.put('/location', authenticate, isAgent, async (req, res) => {
   try {
-    const {
-      latitude, longitude, service_radius,
-      county, sub_county, ward, address_line,
-    } = req.body;
+    const { latitude, longitude, service_radius } = req.body;
 
     const lat = Number(latitude);
     const lng = Number(longitude);
@@ -343,6 +339,35 @@ router.put('/location', authenticate, isAgent, async (req, res) => {
 
     const radius = service_radius != null ? Number(service_radius) : 5000;
 
+    // 👈 1. Fetch the location words from OpenStreetMap
+    let county = null;
+    let subCounty = null;
+    let ward = null;
+    let addressLine = null;
+
+    try {
+      const url = `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=16&addressdetails=1`;
+      const geoRes = await fetch(url, {
+        headers: {
+          'User-Agent': 'GasMtaani/1.0 (contact@gasmtaani.co.ke)',
+          'Accept': 'application/json',
+        },
+      });
+      const geoData = await geoRes.json();
+      
+      if (geoData && geoData.address) {
+        const a = geoData.address;
+        county = a.county || a.state || a.city || null;
+        subCounty = a.city_district || a.suburb || a.town || a.village || null;
+        ward = a.neighbourhood || a.quarter || null;
+        addressLine = geoData.display_name || null;
+      }
+    } catch (geoErr) {
+      console.warn('Reverse geocoding failed:', geoErr.message);
+      // We don't block the save if the geocoder fails
+    }
+
+    // 👈 2. Save to Database
     const { rows } = await pool.query(
       `UPDATE agents
        SET location       = ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
@@ -351,24 +376,14 @@ router.put('/location', authenticate, isAgent, async (req, res) => {
            sub_county     = COALESCE($5, sub_county),
            ward           = COALESCE($6, ward),
            address_line   = COALESCE($7, address_line),
-           hex_id         = (
-             round(
-               (
-                 (ST_X(ST_SetSRID(ST_MakePoint($1, $2), 4326)::geometry) + 30) * cos(radians(30))
-                 - (ST_Y(ST_SetSRID(ST_MakePoint($1, $2), 4326)::geometry) + 5) * sin(radians(30))
-               ) / 0.01
-             )::bigint * 100000
-             + round((ST_Y(ST_SetSRID(ST_MakePoint($1, $2), 4326)::geometry) + 5) / 0.01)::bigint
-           ),
            updated_at     = NOW()
        WHERE id = $8
        RETURNING
          ST_Y(location::geometry) AS lat,
          ST_X(location::geometry) AS lng,
          service_radius,
-         county, sub_county, ward, address_line,
-         hex_id`,
-      [lng, lat, radius, county, sub_county, ward, address_line, req.user.id]
+         county, sub_county, ward, address_line`,
+      [lng, lat, radius, county, subCounty, ward, addressLine, req.user.id]
     );
 
     res.json(rows[0]);
@@ -765,7 +780,7 @@ router.get('/reviews', authenticate, isAgent, async (req, res) => {
 });
 
 // ================================================================
-// WITHDRAWALS (now based on wallet_balance)
+// WITHDRAWALS
 // ================================================================
 router.post('/withdraw', authenticate, isAgent, async (req, res) => {
   const client = await pool.connect();
@@ -849,7 +864,6 @@ router.post('/withdraw', authenticate, isAgent, async (req, res) => {
 
     await client.query('COMMIT');
 
-    // Record wallet movement + re-evaluate breach state
     await walletService.debit(req.user.id, amt, 'WITHDRAWAL');
     await walletService.updateBreachState(req.user.id);
 

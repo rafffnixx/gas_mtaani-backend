@@ -24,7 +24,6 @@ function formatEta(distanceKm) {
 
 // =====================================================
 // GET /api/products
-// All active products (catalogue)
 // =====================================================
 router.get('/', authenticate, async (req, res) => {
   try {
@@ -41,9 +40,7 @@ router.get('/', authenticate, async (req, res) => {
 });
 
 // =====================================================
-// GET /api/products/nearby?lat=&lng=&radius=
-// Products available from agents within `radius` of the customer.
-// MUST be declared before '/:id' so it doesn't get captured.
+// GET /api/products/nearby
 // =====================================================
 router.get('/nearby', authenticate, async (req, res) => {
   try {
@@ -96,7 +93,6 @@ router.get('/nearby', authenticate, async (req, res) => {
       [lat, lng, radius]
     );
 
-    // Enrich with ETA + normalised shape for the mobile app
     const products = rows.map((row) => {
       const eta = formatEta(row.distance_km);
       return {
@@ -158,13 +154,19 @@ router.get('/search/:query', authenticate, async (req, res) => {
 
 // =====================================================
 // GET /api/products/:id
-// MUST be after /nearby and /search
 // =====================================================
 router.get('/:id', authenticate, async (req, res) => {
   try {
+    const { id } = req.params;
+
+    // 👈 THE FIX: Guard against invalid/missing UUID strings
+    if (!id || id === 'undefined' || id === 'null') {
+      return res.status(400).json({ error: 'Invalid product ID format' });
+    }
+
     const result = await pool.query(
       'SELECT * FROM products WHERE id = $1 AND is_active = true',
-      [req.params.id]
+      [id]
     );
 
     if (result.rows.length === 0) {

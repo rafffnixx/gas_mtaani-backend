@@ -10,57 +10,68 @@ const BLOCK_THRESHOLD = Number(process.env.WALLET_BLOCK_THRESHOLD) || -1000;
 const GRACE_MONTHS = Number(process.env.WALLET_GRACE_MONTHS) || 3;
 
 /**
- * Record a wallet movement. Runs inside a transaction so ledger + balance stay in sync.
+ * Record a wallet movement.
+ *
+ * By default runs in its own transaction. Pass `externalClient` to participate
+ * in a caller-owned transaction (the caller MUST have already run BEGIN and
+ * MUST eventually COMMIT or ROLLBACK).
  *
  * @param {string} agentId
- * @param {number} amount  positive = credit, negative = debit
- * @param {string} type    CASH_COMMISSION | MPESA_EARNING | SETTLEMENT | WITHDRAWAL
+ * @param {number} amount          positive = credit, negative = debit
+ * @param {string} type            CASH_COMMISSION | MPESA_EARNING | SETTLEMENT | WITHDRAWAL
  * @param {string|null} orderId
+ * @param {object|null} externalClient  optional pg client inside an open tx
  * @returns {Promise<{balanceAfter:number}>}
  */
-async function record(agentId, amount, type, orderId = null) {
-  const client = await pool.connect();
+async function record(agentId, amount, type, orderId = null, externalClient = null) {
+  const runner = externalClient || (await pool.connect());
+  const ownsTx = !externalClient;
+
   try {
-    await client.query('BEGIN');
+    if (ownsTx) await runner.query('BEGIN');
 
     // 1. Lock the agent row
-    const agentRes = await client.query(
+    const agentRes = await runner.query(
       'SELECT wallet_balance FROM agents WHERE id = $1 FOR UPDATE',
       [agentId]
     );
-    if (agentRes.rows.length === 0) throw new Error(`Agent ${agentId} not found`);
+    if (agentRes.rows.length === 0) {
+      const err = new Error(`Agent ${agentId} not found`);
+      err.code = 'AGENT_NOT_FOUND';
+      throw err;
+    }
 
     const before = Number(agentRes.rows[0].wallet_balance) || 0;
     const after = +(before + Number(amount)).toFixed(2);
 
-    // 2. Update the cached balance
-    await client.query(
+    // 2. Update cached balance
+    await runner.query(
       'UPDATE agents SET wallet_balance = $1, updated_at = NOW() WHERE id = $2',
       [after, agentId]
     );
 
-    // 3. Write the ledger row
-    await client.query(
+    // 3. Write ledger row
+    await runner.query(
       `INSERT INTO wallet_ledger (agent_id, order_id, type, amount, balance_after)
        VALUES ($1, $2, $3, $4, $5)`,
       [agentId, orderId, type, amount, after]
     );
 
-    await client.query('COMMIT');
+    if (ownsTx) await runner.query('COMMIT');
     return { balanceAfter: after };
   } catch (err) {
-    await client.query('ROLLBACK');
+    if (ownsTx) await runner.query('ROLLBACK');
     throw err;
   } finally {
-    client.release();
+    if (ownsTx) runner.release();
   }
 }
 
-const credit = (agentId, amount, type, orderId = null) =>
-  record(agentId, Math.abs(amount), type, orderId);
+const credit = (agentId, amount, type, orderId = null, externalClient = null) =>
+  record(agentId, Math.abs(amount), type, orderId, externalClient);
 
-const debit = (agentId, amount, type, orderId = null) =>
-  record(agentId, -Math.abs(amount), type, orderId);
+const debit = (agentId, amount, type, orderId = null, externalClient = null) =>
+  record(agentId, -Math.abs(amount), type, orderId, externalClient);
 
 /**
  * Recompute grace/block state after any wallet change.
@@ -76,7 +87,6 @@ async function updateBreachState(agentId) {
   const a = r.rows[0];
   const bal = Number(a.wallet_balance);
 
-  // Recovered above threshold → clear breach if not permanently flagged
   if (bal > BLOCK_THRESHOLD) {
     if (a.breached_at && !a.flagged) {
       await pool.query(
@@ -92,7 +102,6 @@ async function updateBreachState(agentId) {
     return { status: a.flagged ? 'FLAGGED_DEBTOR' : 'ACTIVE' };
   }
 
-  // Breached and no clock yet → start the 3-month grace
   if (!a.breached_at) {
     const now = new Date();
     const end = new Date(now);
@@ -119,7 +128,6 @@ async function updateBreachState(agentId) {
 
 /**
  * Throws a structured error if the agent cannot take new orders.
- * Use inside order creation before assigning an order.
  */
 async function assertAgentCanReceiveOrders(agentId) {
   const r = await pool.query(
@@ -146,10 +154,8 @@ async function assertAgentCanReceiveOrders(agentId) {
   const bal = Number(a.wallet_balance);
   if (bal <= BLOCK_THRESHOLD) {
     if (!a.grace_period_ends_at) {
-      // Edge case: breach without a clock — start one now
       await updateBreachState(agentId);
     } else if (new Date(a.grace_period_ends_at) < new Date()) {
-      // Grace already expired but flag never applied — apply now
       await permanentlyBlock(agentId, 'Grace period expired with unpaid commission');
       const err = new Error('Grace period expired. Account permanently blocked.');
       err.code = 'AGENT_BLOCKED';
@@ -197,7 +203,6 @@ async function unblock(agentId, adminId, reason) {
      WHERE id = $1`,
     [agentId]
   );
-  // Audit trail — reuse wallet_ledger with a marker type
   await pool.query(
     `INSERT INTO wallet_ledger (agent_id, type, amount, balance_after)
      SELECT id, 'ADMIN_UNBLOCK', 0, wallet_balance

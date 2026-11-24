@@ -279,7 +279,8 @@ router.put('/business', authenticate, isAgent, async (req, res) => {
 // ================================================================
 // LOCATION (agent's own)
 // ================================================================
-router.get('/location', authenticate, isAgent, async (req, res) => {
+// 👈 FIX: Removed isAgent so they can set location before approval
+router.get('/location', authenticate, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT
@@ -299,7 +300,8 @@ router.get('/location', authenticate, isAgent, async (req, res) => {
   }
 });
 
-router.put('/location', authenticate, isAgent, async (req, res) => {
+// 👈 FIX: Removed isAgent so they can set location before approval
+router.put('/location', authenticate, async (req, res) => {
   try {
     const { latitude, longitude, service_radius } = req.body;
 

@@ -5,7 +5,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const { pool } = require('../config/database');
-const { authenticate, isAgent } = require('../middleware/auth.middleware');
+const { authenticate } = require('../middleware/auth.middleware'); // 👈 Removed isAgent here
 
 // 👈 FIX: Save files to the persistent Render disk
 const uploadDir = '/var/data/uploads/agent-documents';
@@ -52,7 +52,7 @@ const REQUIRED_DOC_TYPES = [
 // =====================================================
 // GET /api/agents/documents   (agent's own list)
 // =====================================================
-router.get('/documents', authenticate, isAgent, async (req, res) => {
+router.get('/documents', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT id, document_type, url, uploaded_at, is_approved, rejection_reason
@@ -71,7 +71,7 @@ router.get('/documents', authenticate, isAgent, async (req, res) => {
 // =====================================================
 // POST /api/agents/upload-docs
 // =====================================================
-router.post('/upload-docs', authenticate, isAgent, upload.single('file'), async (req, res) => {
+router.post('/upload-docs', authenticate, upload.single('file'), async (req, res) => {
   try {
     const agentId = req.user.id;
     const { document_type } = req.body;
@@ -108,7 +108,7 @@ router.post('/upload-docs', authenticate, isAgent, upload.single('file'), async 
 // =====================================================
 // POST /api/agents/submit-application
 // =====================================================
-router.post('/submit-application', authenticate, isAgent, async (req, res) => {
+router.post('/submit-application', authenticate, async (req, res) => {
   try {
     const agentId = req.user.id;
 

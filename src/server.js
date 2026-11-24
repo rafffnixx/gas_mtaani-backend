@@ -10,6 +10,9 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// 👈 FIX: trust Render's reverse proxy so req.protocol === 'https' behind HTTPS
+app.set('trust proxy', 1);
+
 app.use(helmet({
   crossOriginResourcePolicy: { policy: 'cross-origin' },
 }));
@@ -40,13 +43,13 @@ app.use(cors({
   maxAge: 86400,
 }));
 
-// 👈 THE FIX: Only parse JSON if it's NOT a multipart upload
+// Only parse JSON if it's NOT a multipart upload
 const jsonParser = express.json();
 const urlencodedParser = express.urlencoded({ extended: true });
 
 app.use((req, res, next) => {
   if (req.headers['content-type'] && req.headers['content-type'].includes('multipart/form-data')) {
-    return next(); // Skip JSON parsing for file uploads
+    return next();
   }
   jsonParser(req, res, next);
 });
@@ -59,10 +62,12 @@ app.use((req, res, next) => {
 });
 
 app.use('/assets', express.static(path.join(__dirname, '..', 'assets')));
-app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
+// 👈 FIX: uploads live at backend/uploads (multer writes to process.cwd()/uploads)
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// ... (all your existing routes remain exactly the same)
-
+// ================================================================
+// ROUTES
+// ================================================================
 const authRoutes          = require('./routes/auth.routes');
 const adminAuthRoutes     = require('./routes/adminAuth.routes');
 const customerRoutes      = require('./routes/customer.routes');
@@ -93,8 +98,8 @@ app.use('/api/chat',      chatRoutes);
 app.use('/api/notifications', notificationsRoutes);
 app.use('/api/agora', agoraRoutes);
 app.use('/api/agents/business-hours', businessHoursRoutes);
-app.use('/api/agents', agentDocumentsRoutes);
-app.use('/api/agents',    agentRoutes);
+app.use('/api/agents', agentDocumentsRoutes); // /documents, /upload-docs, /submit-application
+app.use('/api/agents', agentRoutes);          // everything else
 app.use('/api/users/notification-preferences', notificationPreferencesRoutes);
 app.use('/api/orders',    quoteRoutes);
 app.use('/api/orders',    orderRoutes);

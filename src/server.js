@@ -62,8 +62,8 @@ app.use((req, res, next) => {
 });
 
 app.use('/assets', express.static(path.join(__dirname, '..', 'assets')));
-// 👈 FIX: Serve uploads from the persistent Render disk
-app.use('/uploads', express.static('/var/data/uploads'));
+// 👈 FIX: Serve uploads from the Render Disk mount path
+app.use('/uploads', express.static('/opt/render/project/src/uploads'));
 
 // ================================================================
 // ROUTES

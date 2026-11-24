@@ -5,10 +5,11 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const { pool } = require('../config/database');
-const { authenticate } = require('../middleware/auth.middleware'); // 👈 Removed isAgent here
+const { authenticate } = require('../middleware/auth.middleware'); // Removed isAgent so unapproved users can upload
 
-// 👈 FIX: Save files to the persistent Render disk
-const uploadDir = '/var/data/uploads/agent-documents';
+// 👈 FIX: Mount directly into the Render project source folder to avoid root permission errors
+const uploadDir = '/opt/render/project/src/uploads/agent-documents';
+
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
 }

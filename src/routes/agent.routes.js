@@ -40,7 +40,7 @@ router.get('/dashboard', authenticate, isAgent, async (req, res) => {
 });
 
 // ================================================================
-// STATUS — approval check
+// STATUS
 // ================================================================
 router.get('/status', authenticate, isAgent, async (req, res) => {
   try {
@@ -54,7 +54,11 @@ router.get('/status', authenticate, isAgent, async (req, res) => {
       return res.status(403).json({ error: 'Agent account not approved' });
     }
     if (!agent.is_approved) {
-      return res.status(403).json({ error: 'Agent account not approved' });
+      return res.status(403).json({
+        error: 'Agent account not approved',
+        is_approved: false,
+        is_location_verified: agent.is_location_verified ?? false,
+      });
     }
     res.json({
       business_name: agent.business_name,
@@ -115,14 +119,8 @@ router.get('/wallet/ledger', authenticate, isAgent, async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit) || 50, 200);
     const r = await pool.query(
       `SELECT 
-         wl.id, 
-         wl.type, 
-         wl.amount, 
-         wl.balance_after, 
-         wl.order_id, 
-         wl.created_at,
-         o.order_number,
-         o.total_amount AS order_total
+         wl.id, wl.type, wl.amount, wl.balance_after, wl.order_id, wl.created_at,
+         o.order_number, o.total_amount AS order_total
        FROM wallet_ledger wl
        LEFT JOIN orders o ON o.id = wl.order_id
        WHERE wl.agent_id = $1
@@ -169,10 +167,7 @@ router.get('/settle/callback', async (req, res) => {
       try {
         await settlementService.applyOutcome({ trackingId: OrderTrackingId });
       } catch (verifyErr) {
-        console.warn(
-          'settle callback verify failed:',
-          verifyErr?.details || verifyErr.message
-        );
+        console.warn('settle callback verify failed:', verifyErr?.details || verifyErr.message);
       }
     }
     const deepLink = `gasmtaani://settle-result?trackingId=${
@@ -196,9 +191,7 @@ async function handleSettleIPN(req, res) {
       src.orderMerchantReference;
 
     if (!OrderTrackingId) {
-      return res
-        .status(400)
-        .json({ error: 'Missing OrderTrackingId in settlement IPN' });
+      return res.status(400).json({ error: 'Missing OrderTrackingId in settlement IPN' });
     }
 
     await settlementService.applyOutcome({ trackingId: OrderTrackingId });
@@ -225,21 +218,13 @@ router.post('/settle/ipn', handleSettleIPN);
 router.get('/business', authenticate, isAgent, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT business_name,
-              business_registration_number,
-              kra_pin,
-              id_number,
-              business_license_url,
-              profile_photo_url,
-              service_radius,
-              is_approved,
-              approval_date
+      `SELECT business_name, business_registration_number, kra_pin, id_number,
+              business_license_url, profile_photo_url, service_radius,
+              is_approved, approval_date
        FROM agents WHERE id = $1`,
       [req.user.id]
     );
-    if (rows.length === 0) {
-      return res.status(404).json({ error: 'Agent not found' });
-    }
+    if (rows.length === 0) return res.status(404).json({ error: 'Agent not found' });
     res.json(rows[0]);
   } catch (error) {
     console.error('Business fetch error:', error.message, error.detail || '');
@@ -250,11 +235,7 @@ router.get('/business', authenticate, isAgent, async (req, res) => {
 router.put('/business', authenticate, isAgent, async (req, res) => {
   try {
     const {
-      business_name,
-      business_registration_number,
-      kra_pin,
-      id_number,
-      profile_photo_url,
+      business_name, business_registration_number, kra_pin, id_number, profile_photo_url,
     } = req.body;
 
     if (!business_name || !business_name.trim()) {
@@ -276,12 +257,8 @@ router.put('/business', authenticate, isAgent, async (req, res) => {
            profile_photo_url            = COALESCE($5, profile_photo_url),
            updated_at                   = NOW()
        WHERE id = $6
-       RETURNING business_name,
-                 business_registration_number,
-                 kra_pin,
-                 id_number,
-                 business_license_url,
-                 profile_photo_url`,
+       RETURNING business_name, business_registration_number, kra_pin, id_number,
+                 business_license_url, profile_photo_url`,
       [
         business_name.trim(),
         business_registration_number?.trim() || null,
@@ -300,7 +277,7 @@ router.put('/business', authenticate, isAgent, async (req, res) => {
 });
 
 // ================================================================
-// LOCATION
+// LOCATION (agent's own)
 // ================================================================
 router.get('/location', authenticate, isAgent, async (req, res) => {
   try {
@@ -314,9 +291,7 @@ router.get('/location', authenticate, isAgent, async (req, res) => {
        FROM agents WHERE id = $1`,
       [req.user.id]
     );
-    if (rows.length === 0) {
-      return res.status(404).json({ error: 'Agent not found' });
-    }
+    if (rows.length === 0) return res.status(404).json({ error: 'Agent not found' });
     res.json(rows[0]);
   } catch (error) {
     console.error('Location fetch error:', error.message, error.detail || '');
@@ -354,7 +329,7 @@ router.put('/location', authenticate, isAgent, async (req, res) => {
         },
       });
       const geoData = await geoRes.json();
-      
+
       if (geoData && geoData.address) {
         const a = geoData.address;
         county = a.county || a.state || a.city || null;
@@ -366,17 +341,20 @@ router.put('/location', authenticate, isAgent, async (req, res) => {
       console.warn('Reverse geocoding failed:', geoErr.message);
     }
 
-    // 👈 RESET VERIFICATION: Saving a new location requires admin re-approval
+    // NOTE: no COALESCE on county/sub_county/ward/address_line — if geocode fails,
+    // we clear stale values so admin doesn't see old address with new coords.
     const { rows } = await pool.query(
       `UPDATE agents
-       SET location       = ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
-           service_radius = COALESCE($3, service_radius),
-           county         = COALESCE($4, county),
-           sub_county     = COALESCE($5, sub_county),
-           ward           = COALESCE($6, ward),
-           address_line   = COALESCE($7, address_line),
+       SET location             = ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
+           current_latitude     = $2,
+           current_longitude    = $1,
+           service_radius       = COALESCE($3, service_radius),
+           county               = $4,
+           sub_county           = $5,
+           ward                 = $6,
+           address_line         = $7,
            is_location_verified = false,
-           updated_at     = NOW()
+           updated_at           = NOW()
        WHERE id = $8
        RETURNING
          ST_Y(location::geometry) AS lat,
@@ -394,27 +372,6 @@ router.put('/location', authenticate, isAgent, async (req, res) => {
   }
 });
 
-// 👈 NEW: Admin route to verify the agent's location
-router.put('/:agentId/verify-location', authenticate, async (req, res) => {
-  try {
-    if (req.user.user_type !== 'admin') {
-      return res.status(403).json({ error: 'Admin only' });
-    }
-    const { agentId } = req.params;
-    const { is_verified } = req.body;
-
-    await pool.query(
-      `UPDATE agents SET is_location_verified = $1 WHERE id = $2`,
-      [is_verified, agentId]
-    );
-
-    res.json({ success: true, message: is_verified ? 'Location verified' : 'Location rejected' });
-  } catch (err) {
-    console.error('Verify location error:', err);
-    res.status(500).json({ error: 'Failed to verify location' });
-  }
-});
-
 // ================================================================
 // ONLINE TOGGLE
 // ================================================================
@@ -423,15 +380,14 @@ router.put('/online', authenticate, isAgent, async (req, res) => {
     const { is_online } = req.body;
     const agentId = req.user.id;
 
-    // 👈 CHECK: Block going online if location is unverified
     if (is_online) {
       const check = await pool.query(
         `SELECT is_location_verified FROM agents WHERE id = $1`,
         [agentId]
       );
       if (!check.rows[0]?.is_location_verified) {
-        return res.status(403).json({ 
-          error: 'Your location is pending admin verification. You cannot go online yet.' 
+        return res.status(403).json({
+          error: 'Your location is pending admin verification. You cannot go online yet.',
         });
       }
     }
@@ -454,20 +410,10 @@ router.put('/online', authenticate, isAgent, async (req, res) => {
 router.get('/inventory', authenticate, isAgent, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT ai.id,
-              ai.product_id,
-              ai.stock_quantity,
-              ai.is_available,
-              ai.min_stock_level,
-              ai.max_stock_level,
-              ai.reorder_quantity,
-              ai.price_modifier,
-              p.name        AS product_name,
-              p.brand_name  AS brand_name,
-              p.image_url   AS image_url,
-              p.weight_kg   AS weight_kg,
-              p.base_price  AS price,
-              p.product_type
+      `SELECT ai.id, ai.product_id, ai.stock_quantity, ai.is_available,
+              ai.min_stock_level, ai.max_stock_level, ai.reorder_quantity, ai.price_modifier,
+              p.name AS product_name, p.brand_name AS brand_name, p.image_url AS image_url,
+              p.weight_kg AS weight_kg, p.base_price AS price, p.product_type
        FROM agent_inventory ai
        JOIN products p ON p.id = ai.product_id
        WHERE ai.agent_id = $1
@@ -486,9 +432,7 @@ router.post('/inventory', authenticate, isAgent, async (req, res) => {
     const { product_id, stock, stock_quantity, is_available } = req.body;
     const qty = stock ?? stock_quantity ?? 0;
 
-    if (!product_id) {
-      return res.status(400).json({ error: 'product_id is required' });
-    }
+    if (!product_id) return res.status(400).json({ error: 'product_id is required' });
 
     const { rows } = await pool.query(
       `INSERT INTO agent_inventory (agent_id, product_id, stock_quantity, is_available)
@@ -548,10 +492,10 @@ router.get('/earnings', authenticate, isAgent, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT
-         COALESCE(SUM(amount) FILTER (WHERE DATE(created_at) = CURRENT_DATE), 0)             AS today,
-         COALESCE(SUM(amount) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days'), 0)     AS this_week,
-         COALESCE(SUM(amount) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days'), 0)    AS this_month,
-         COALESCE(SUM(amount), 0)                                                            AS total
+         COALESCE(SUM(amount) FILTER (WHERE DATE(created_at) = CURRENT_DATE), 0)          AS today,
+         COALESCE(SUM(amount) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days'), 0)  AS this_week,
+         COALESCE(SUM(amount) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days'), 0) AS this_month,
+         COALESCE(SUM(amount), 0)                                                         AS total
        FROM agent_earnings
        WHERE agent_id = $1`,
       [req.user.id]
@@ -593,31 +537,26 @@ router.get('/orders/new', authenticate, isAgent, async (req, res) => {
     const { rows } = await pool.query(
       `
       WITH order_items_agg AS (
-        SELECT
-          oi.order_id,
-          json_agg(
-            json_build_object(
-              'product_id',   oi.product_id,
-              'product_name', p.name,
-              'brand_name',   p.brand_name,
-              'image_url',    p.image_url,
-              'quantity',     oi.quantity,
-              'unit_price',   oi.unit_price
-            )
-            ORDER BY oi.created_at ASC
-          ) AS items
+        SELECT oi.order_id,
+          json_agg(json_build_object(
+            'product_id',   oi.product_id,
+            'product_name', p.name,
+            'brand_name',   p.brand_name,
+            'image_url',    p.image_url,
+            'quantity',     oi.quantity,
+            'unit_price',   oi.unit_price
+          ) ORDER BY oi.created_at ASC) AS items
         FROM order_items oi
         LEFT JOIN products p ON p.id = oi.product_id
         GROUP BY oi.order_id
       )
-      SELECT
-        o.*,
-        COALESCE(p.name,      oia.items->0->>'product_name') AS product_name,
-        COALESCE(p.brand_name, oia.items->0->>'brand_name')  AS brand_name,
-        COALESCE(p.image_url,  oia.items->0->>'image_url')   AS product_image,
-        COALESCE(oia.items, '[]'::json)                      AS items,
-        NULL::text                                           AS customer_name,
-        NULL::text                                           AS customer_phone
+      SELECT o.*,
+        COALESCE(p.name,       oia.items->0->>'product_name') AS product_name,
+        COALESCE(p.brand_name, oia.items->0->>'brand_name')   AS brand_name,
+        COALESCE(p.image_url,  oia.items->0->>'image_url')    AS product_image,
+        COALESCE(oia.items, '[]'::json)                       AS items,
+        NULL::text                                            AS customer_name,
+        NULL::text                                            AS customer_phone
       FROM orders o
       LEFT JOIN products p          ON p.id = o.product_id
       LEFT JOIN order_items_agg oia ON oia.order_id = o.id
@@ -640,31 +579,26 @@ router.get('/orders', authenticate, isAgent, async (req, res) => {
     const { rows } = await pool.query(
       `
       WITH order_items_agg AS (
-        SELECT
-          oi.order_id,
-          json_agg(
-            json_build_object(
-              'product_id',   oi.product_id,
-              'product_name', p.name,
-              'brand_name',   p.brand_name,
-              'image_url',    p.image_url,
-              'quantity',     oi.quantity,
-              'unit_price',   oi.unit_price
-            )
-            ORDER BY oi.created_at ASC
-          ) AS items
+        SELECT oi.order_id,
+          json_agg(json_build_object(
+            'product_id',   oi.product_id,
+            'product_name', p.name,
+            'brand_name',   p.brand_name,
+            'image_url',    p.image_url,
+            'quantity',     oi.quantity,
+            'unit_price',   oi.unit_price
+          ) ORDER BY oi.created_at ASC) AS items
         FROM order_items oi
         LEFT JOIN products p ON p.id = oi.product_id
         GROUP BY oi.order_id
       )
-      SELECT
-        o.*,
-        COALESCE(p.name,      oia.items->0->>'product_name') AS product_name,
-        COALESCE(p.brand_name, oia.items->0->>'brand_name')  AS brand_name,
-        COALESCE(p.image_url,  oia.items->0->>'image_url')   AS product_image,
-        COALESCE(oia.items, '[]'::json)                      AS items,
-        NULL::text                                           AS customer_name,
-        NULL::text                                           AS customer_phone
+      SELECT o.*,
+        COALESCE(p.name,       oia.items->0->>'product_name') AS product_name,
+        COALESCE(p.brand_name, oia.items->0->>'brand_name')   AS brand_name,
+        COALESCE(p.image_url,  oia.items->0->>'image_url')    AS product_image,
+        COALESCE(oia.items, '[]'::json)                       AS items,
+        NULL::text                                            AS customer_name,
+        NULL::text                                            AS customer_phone
       FROM orders o
       LEFT JOIN products p          ON p.id = o.product_id
       LEFT JOIN order_items_agg oia ON oia.order_id = o.id
@@ -686,16 +620,13 @@ router.get('/orders', authenticate, isAgent, async (req, res) => {
 router.get('/payout-details', authenticate, isAgent, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT mpesa_number, mpesa_name,
-              bank_name, bank_account_name, bank_account_no, bank_branch,
-              preferred_payout,
-              total_earnings, available_balance, wallet_balance, status, flagged
+      `SELECT mpesa_number, mpesa_name, bank_name, bank_account_name, bank_account_no,
+              bank_branch, preferred_payout, total_earnings, available_balance,
+              wallet_balance, status, flagged
        FROM agents WHERE id = $1`,
       [req.user.id]
     );
-    if (rows.length === 0) {
-      return res.status(404).json({ error: 'Agent not found' });
-    }
+    if (rows.length === 0) return res.status(404).json({ error: 'Agent not found' });
     res.json(rows[0]);
   } catch (error) {
     console.error('Payout details fetch error:', error.message, error.detail || '');
@@ -706,9 +637,8 @@ router.get('/payout-details', authenticate, isAgent, async (req, res) => {
 router.put('/payout-details', authenticate, isAgent, async (req, res) => {
   try {
     const {
-      mpesa_number, mpesa_name,
-      bank_name, bank_account_name, bank_account_no, bank_branch,
-      preferred_payout,
+      mpesa_number, mpesa_name, bank_name, bank_account_name, bank_account_no,
+      bank_branch, preferred_payout,
     } = req.body;
 
     if (preferred_payout && !['mpesa', 'bank'].includes(preferred_payout)) {
@@ -732,13 +662,11 @@ router.put('/payout-details', authenticate, isAgent, async (req, res) => {
            preferred_payout  = COALESCE($7, preferred_payout),
            updated_at        = NOW()
        WHERE id = $8
-       RETURNING mpesa_number, mpesa_name,
-                 bank_name, bank_account_name, bank_account_no, bank_branch,
-                 preferred_payout`,
+       RETURNING mpesa_number, mpesa_name, bank_name, bank_account_name,
+                 bank_account_no, bank_branch, preferred_payout`,
       [
-        mpesa_number, mpesa_name,
-        bank_name, bank_account_name, bank_account_no, bank_branch,
-        preferred_payout, req.user.id,
+        mpesa_number, mpesa_name, bank_name, bank_account_name, bank_account_no,
+        bank_branch, preferred_payout, req.user.id,
       ]
     );
 
@@ -754,35 +682,23 @@ router.put('/payout-details', authenticate, isAgent, async (req, res) => {
 // ================================================================
 router.get('/reviews', authenticate, isAgent, async (req, res) => {
   try {
-    const agentId = req.user.id;
-
     const result = await pool.query(
-      `SELECT
-         o.id,
-         o.order_number,
-         o.customer_rating   AS rating,
-         o.customer_feedback AS feedback,
-         o.delivered_at,
-         o.confirmed_at,
-         o.updated_at,
-         u.full_name         AS customer_name
+      `SELECT o.id, o.order_number, o.customer_rating AS rating,
+              o.customer_feedback AS feedback, o.delivered_at, o.confirmed_at,
+              o.updated_at, u.full_name AS customer_name
        FROM orders o
        LEFT JOIN users u ON u.id = o.customer_id
-       WHERE o.agent_id = $1
-         AND o.customer_rating IS NOT NULL
+       WHERE o.agent_id = $1 AND o.customer_rating IS NOT NULL
        ORDER BY COALESCE(o.confirmed_at, o.delivered_at, o.updated_at) DESC
        LIMIT 100`,
-      [agentId]
+      [req.user.id]
     );
 
     const reviews = result.rows.map((r) => {
       let initials = 'Customer';
       if (r.customer_name) {
         const parts = r.customer_name.trim().split(/\s+/);
-        initials = parts
-          .map((p) => (p[0] || '').toUpperCase())
-          .filter(Boolean)
-          .join('.');
+        initials = parts.map((p) => (p[0] || '').toUpperCase()).filter(Boolean).join('.');
       }
       return {
         id: r.id,
@@ -831,10 +747,8 @@ router.post('/withdraw', authenticate, isAgent, async (req, res) => {
     }
 
     const { rows } = await client.query(
-      `SELECT wallet_balance, status, flagged,
-              preferred_payout,
-              mpesa_number, mpesa_name,
-              bank_name, bank_account_name, bank_account_no
+      `SELECT wallet_balance, status, flagged, preferred_payout,
+              mpesa_number, mpesa_name, bank_name, bank_account_name, bank_account_no
        FROM agents WHERE id = $1 FOR UPDATE`,
       [req.user.id]
     );
@@ -897,10 +811,17 @@ router.post('/withdraw', authenticate, isAgent, async (req, res) => {
       [req.user.id, amt, chosen, dest.name, dest.number, dest.bank]
     );
 
+    // 👈 FIX: debit inside the transaction so money leak can't happen
+    await walletService.debit(req.user.id, amt, 'WITHDRAWAL', client);
+
     await client.query('COMMIT');
 
-    await walletService.debit(req.user.id, amt, 'WITHDRAWAL');
-    await walletService.updateBreachState(req.user.id);
+    // Non-critical side-effect after commit
+    try {
+      await walletService.updateBreachState(req.user.id);
+    } catch (postErr) {
+      console.warn('updateBreachState post-commit failed:', postErr.message);
+    }
 
     res.json({ success: true, withdrawal: w.rows[0] });
   } catch (error) {
@@ -926,14 +847,53 @@ router.get('/withdrawals', authenticate, isAgent, async (req, res) => {
 });
 
 // ================================================================
-// REGISTRATION / DOCS
+// ADMIN — LOCATION (must be at bottom, after literal routes)
 // ================================================================
-router.post('/register', authenticate, async (req, res) => {
-  res.status(501).json({ error: 'Agent self-registration not implemented yet' });
+
+// GET agent's current location for admin review
+router.get('/:agentId/location', authenticate, async (req, res) => {
+  try {
+    if (req.user.user_type !== 'admin') {
+      return res.status(403).json({ error: 'Admin only' });
+    }
+    const { rows } = await pool.query(
+      `SELECT
+         ST_Y(location::geometry) AS lat,
+         ST_X(location::geometry) AS lng,
+         service_radius,
+         county, sub_county, ward, address_line,
+         is_location_verified
+       FROM agents WHERE id = $1`,
+      [req.params.agentId]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Agent not found' });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('Admin get location error:', err);
+    res.status(500).json({ error: 'Failed to load location' });
+  }
 });
 
-router.post('/upload-docs', authenticate, isAgent, async (req, res) => {
-  res.status(501).json({ error: 'Document upload not implemented yet' });
+// Approve / revoke an agent's location
+router.put('/:agentId/verify-location', authenticate, async (req, res) => {
+  try {
+    if (req.user.user_type !== 'admin') {
+      return res.status(403).json({ error: 'Admin only' });
+    }
+    const { is_verified } = req.body;
+    const { rows } = await pool.query(
+      `UPDATE agents
+       SET is_location_verified = $1, updated_at = NOW()
+       WHERE id = $2
+       RETURNING id, is_location_verified`,
+      [!!is_verified, req.params.agentId]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Agent not found' });
+    res.json({ success: true, agent: rows[0] });
+  } catch (err) {
+    console.error('Verify location error:', err);
+    res.status(500).json({ error: 'Failed to verify location' });
+  }
 });
 
 module.exports = router;

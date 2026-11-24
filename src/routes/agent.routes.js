@@ -45,7 +45,7 @@ router.get('/dashboard', authenticate, isAgent, async (req, res) => {
 router.get('/status', authenticate, isAgent, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT business_name, is_online, rating, total_deliveries, is_approved
+      `SELECT business_name, is_online, rating, total_deliveries, is_approved, is_location_verified
        FROM agents WHERE id = $1`,
       [req.user.id]
     );
@@ -61,6 +61,7 @@ router.get('/status', authenticate, isAgent, async (req, res) => {
       is_online: agent.is_online ?? false,
       rating: Number(agent.rating || 0),
       total_deliveries: agent.total_deliveries || 0,
+      is_location_verified: agent.is_location_verified ?? false,
     });
   } catch (error) {
     console.error('Status error:', error.message, error.detail || '');
@@ -308,7 +309,8 @@ router.get('/location', authenticate, isAgent, async (req, res) => {
          ST_Y(location::geometry) AS lat,
          ST_X(location::geometry) AS lng,
          service_radius,
-         county, sub_county, ward, address_line
+         county, sub_county, ward, address_line,
+         is_location_verified
        FROM agents WHERE id = $1`,
       [req.user.id]
     );
@@ -322,7 +324,6 @@ router.get('/location', authenticate, isAgent, async (req, res) => {
   }
 });
 
-// 👈 UPDATED: DECODE GPS TO WORDS ON THE BACKEND
 router.put('/location', authenticate, isAgent, async (req, res) => {
   try {
     const { latitude, longitude, service_radius } = req.body;
@@ -339,7 +340,6 @@ router.put('/location', authenticate, isAgent, async (req, res) => {
 
     const radius = service_radius != null ? Number(service_radius) : 5000;
 
-    // 👈 1. Fetch the location words from OpenStreetMap
     let county = null;
     let subCounty = null;
     let ward = null;
@@ -364,10 +364,9 @@ router.put('/location', authenticate, isAgent, async (req, res) => {
       }
     } catch (geoErr) {
       console.warn('Reverse geocoding failed:', geoErr.message);
-      // We don't block the save if the geocoder fails
     }
 
-    // 👈 2. Save to Database
+    // 👈 RESET VERIFICATION: Saving a new location requires admin re-approval
     const { rows } = await pool.query(
       `UPDATE agents
        SET location       = ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
@@ -376,13 +375,15 @@ router.put('/location', authenticate, isAgent, async (req, res) => {
            sub_county     = COALESCE($5, sub_county),
            ward           = COALESCE($6, ward),
            address_line   = COALESCE($7, address_line),
+           is_location_verified = false,
            updated_at     = NOW()
        WHERE id = $8
        RETURNING
          ST_Y(location::geometry) AS lat,
          ST_X(location::geometry) AS lng,
          service_radius,
-         county, sub_county, ward, address_line`,
+         county, sub_county, ward, address_line,
+         is_location_verified`,
       [lng, lat, radius, county, subCounty, ward, addressLine, req.user.id]
     );
 
@@ -393,6 +394,27 @@ router.put('/location', authenticate, isAgent, async (req, res) => {
   }
 });
 
+// 👈 NEW: Admin route to verify the agent's location
+router.put('/:agentId/verify-location', authenticate, async (req, res) => {
+  try {
+    if (req.user.user_type !== 'admin') {
+      return res.status(403).json({ error: 'Admin only' });
+    }
+    const { agentId } = req.params;
+    const { is_verified } = req.body;
+
+    await pool.query(
+      `UPDATE agents SET is_location_verified = $1 WHERE id = $2`,
+      [is_verified, agentId]
+    );
+
+    res.json({ success: true, message: is_verified ? 'Location verified' : 'Location rejected' });
+  } catch (err) {
+    console.error('Verify location error:', err);
+    res.status(500).json({ error: 'Failed to verify location' });
+  }
+});
+
 // ================================================================
 // ONLINE TOGGLE
 // ================================================================
@@ -400,6 +422,19 @@ router.put('/online', authenticate, isAgent, async (req, res) => {
   try {
     const { is_online } = req.body;
     const agentId = req.user.id;
+
+    // 👈 CHECK: Block going online if location is unverified
+    if (is_online) {
+      const check = await pool.query(
+        `SELECT is_location_verified FROM agents WHERE id = $1`,
+        [agentId]
+      );
+      if (!check.rows[0]?.is_location_verified) {
+        return res.status(403).json({ 
+          error: 'Your location is pending admin verification. You cannot go online yet.' 
+        });
+      }
+    }
 
     const result = await pool.query(
       'UPDATE agents SET is_online = $1 WHERE id = $2 RETURNING is_online',

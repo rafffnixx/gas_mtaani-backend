@@ -10,7 +10,7 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// 👈 FIX: trust Render's reverse proxy so req.protocol === 'https' behind HTTPS
+// trust Render's reverse proxy so req.protocol === 'https' behind HTTPS
 app.set('trust proxy', 1);
 
 app.use(helmet({
@@ -62,8 +62,8 @@ app.use((req, res, next) => {
 });
 
 app.use('/assets', express.static(path.join(__dirname, '..', 'assets')));
-// 👈 FIX: uploads live at backend/uploads (multer writes to process.cwd()/uploads)
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+// 👈 FIX: Serve uploads from the persistent Render disk
+app.use('/uploads', express.static('/var/data/uploads'));
 
 // ================================================================
 // ROUTES

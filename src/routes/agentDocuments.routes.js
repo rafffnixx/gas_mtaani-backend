@@ -7,7 +7,8 @@ const fs = require('fs');
 const { pool } = require('../config/database');
 const { authenticate, isAgent } = require('../middleware/auth.middleware');
 
-const uploadDir = path.join(process.cwd(), 'uploads', 'agent-documents');
+// 👈 FIX: Save files to the persistent Render disk
+const uploadDir = '/var/data/uploads/agent-documents';
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
 }

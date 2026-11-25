@@ -82,6 +82,7 @@ router.post('/quote', authenticate, async (req, res) => {
         WHERE a.hex_id = ANY($1::bigint[])
           AND a.is_online = true
           AND a.is_approved = true
+          AND a.service_radius > 0              -- 👈 THE ONLY FIX: reject 0-radius agents
           AND a.current_order_count < a.max_order_capacity
           AND ai.product_id = ANY($2::uuid[])
           AND ai.is_available = true

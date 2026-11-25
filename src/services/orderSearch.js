@@ -1,22 +1,10 @@
 // 📁 backend/src/services/orderSearch.js
-//
-// Shared agent-search + reassignment + timeout logic.
-// Used by BOTH order.routes.js (order creation) and payment.routes.js
-// (deferred search after Pesapal payment confirms).
-//
-// The timers Maps live here at module scope so they survive across
-// requests and are shared between the two routes.
-
 const { pool } = require('../config/database');
 const { latLngToHex, hexesUpToRing } = require('../utils/hexGrid');
 const { notifyOrderEvent } = require('./notificationService');
 
-// ---------------------------------------------------------
-// Timers — module-level. Every searching / assigned order
-// has at most one of each.
-// ---------------------------------------------------------
-const reassignTimers = new Map();   // orderId -> timeout handle
-const searchTimers   = new Map();   // orderId -> timeout handle
+const reassignTimers = new Map();
+const searchTimers   = new Map();
 
 const REASSIGN_AFTER_MS  = Number(process.env.REASSIGN_AFTER_MS)  || 3 * 60 * 1000;
 const SEARCH_TIMEOUT_MS  = Number(process.env.SEARCH_TIMEOUT_MS)  || 3 * 60 * 1000;
@@ -43,9 +31,6 @@ function clearAllTimers(orderId) {
   clearSearchTimer(orderId);
 }
 
-// ---------------------------------------------------------
-// Schedule the search-timeout timer for a searching order
-// ---------------------------------------------------------
 function scheduleSearchTimeout(orderId) {
   clearSearchTimer(orderId);
   const handle = setTimeout(() => {
@@ -57,9 +42,6 @@ function scheduleSearchTimeout(orderId) {
   searchTimers.set(orderId, handle);
 }
 
-// ---------------------------------------------------------
-// Schedule the reassign timer for an assigned order
-// ---------------------------------------------------------
 function scheduleReassignTimeout(orderId) {
   clearReassignTimer(orderId);
   const handle = setTimeout(() => {
@@ -71,10 +53,6 @@ function scheduleReassignTimeout(orderId) {
   reassignTimers.set(orderId, handle);
 }
 
-// =====================================================
-// BACKGROUND: Find an agent for this order.
-// Excludes agents in orders.excluded_agent_ids.
-// =====================================================
 async function runAgentSearch(orderId) {
   try {
     const { rows } = await pool.query(
@@ -125,6 +103,7 @@ async function runAgentSearch(orderId) {
         WHERE a.hex_id = ANY($1::bigint[])
           AND a.is_online = true
           AND a.is_approved = true
+          AND a.service_radius > 0              -- 👈 ADDED: Reject 0-radius agents
           AND a.current_order_count < a.max_order_capacity
           AND ai.product_id = ANY($2::uuid[])
           AND ai.stock_quantity > 0
@@ -234,9 +213,6 @@ async function runAgentSearch(orderId) {
   }
 }
 
-// =====================================================
-// Reassignment handler
-// =====================================================
 async function handleReassignment(orderId) {
   try {
     const { rows } = await pool.query(
@@ -340,9 +316,6 @@ async function handleReassignment(orderId) {
   }
 }
 
-// =====================================================
-// Search timeout
-// =====================================================
 async function handleSearchTimeout(orderId) {
   try {
     const result = await pool.query(
@@ -369,9 +342,6 @@ async function handleSearchTimeout(orderId) {
   }
 }
 
-// =====================================================
-// PUBLIC: begin search for an order (called after payment success)
-// =====================================================
 async function startSearchForOrder(orderId) {
   clearAllTimers(orderId);
   runAgentSearch(orderId).catch((err) =>

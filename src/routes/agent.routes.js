@@ -4,6 +4,7 @@ const router = express.Router();
 const { pool } = require('../config/database');
 const { authenticate, isAgent } = require('../middleware/auth.middleware');
 const walletService = require('../services/walletService');
+const { latLngToHex } = require('../utils/hexGrid'); // 👈 Import H3/Hex utility
 
 // ================================================================
 // DASHBOARD
@@ -277,9 +278,8 @@ router.put('/business', authenticate, isAgent, async (req, res) => {
 });
 
 // ================================================================
-// LOCATION (agent's own)
+// LOCATION (agent's own) — includes hex_id recalculation
 // ================================================================
-// 👈 FIX: Removed isAgent so they can set location before approval
 router.get('/location', authenticate, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -300,7 +300,6 @@ router.get('/location', authenticate, async (req, res) => {
   }
 });
 
-// 👈 FIX: Removed isAgent so they can set location before approval
 router.put('/location', authenticate, async (req, res) => {
   try {
     const { latitude, longitude, service_radius } = req.body;
@@ -314,6 +313,10 @@ router.put('/location', authenticate, async (req, res) => {
     if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
       return res.status(400).json({ error: 'latitude/longitude out of range' });
     }
+
+    // 👈 RECALCULATE HEX ID
+    const newHexId = latLngToHex(lat, lng);
+    console.log(`[location] recalculated hex_id ${newHexId} for agent ${req.user.id}`);
 
     const radius = service_radius != null ? Number(service_radius) : 5000;
 
@@ -343,13 +346,12 @@ router.put('/location', authenticate, async (req, res) => {
       console.warn('Reverse geocoding failed:', geoErr.message);
     }
 
-    // NOTE: no COALESCE on county/sub_county/ward/address_line — if geocode fails,
-    // we clear stale values so admin doesn't see old address with new coords.
     const { rows } = await pool.query(
       `UPDATE agents
        SET location             = ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
            current_latitude     = $2,
            current_longitude    = $1,
+           hex_id               = $9,           -- 👈 Save new hex
            service_radius       = COALESCE($3, service_radius),
            county               = $4,
            sub_county           = $5,
@@ -362,9 +364,10 @@ router.put('/location', authenticate, async (req, res) => {
          ST_Y(location::geometry) AS lat,
          ST_X(location::geometry) AS lng,
          service_radius,
+         hex_id,
          county, sub_county, ward, address_line,
          is_location_verified`,
-      [lng, lat, radius, county, subCounty, ward, addressLine, req.user.id]
+      [lng, lat, radius, county, subCounty, ward, addressLine, req.user.id, newHexId]
     );
 
     res.json(rows[0]);
@@ -849,46 +852,52 @@ router.get('/withdrawals', authenticate, isAgent, async (req, res) => {
 });
 
 // ================================================================
-// ADMIN — LOCATION (must be at bottom, after literal routes)
+// ADMIN — Approve/revoke location (also recalculates hex_id on approval)
 // ================================================================
-
-// GET agent's current location for admin review
-router.get('/:agentId/location', authenticate, async (req, res) => {
-  try {
-    if (req.user.user_type !== 'admin') {
-      return res.status(403).json({ error: 'Admin only' });
-    }
-    const { rows } = await pool.query(
-      `SELECT
-         ST_Y(location::geometry) AS lat,
-         ST_X(location::geometry) AS lng,
-         service_radius,
-         county, sub_county, ward, address_line,
-         is_location_verified
-       FROM agents WHERE id = $1`,
-      [req.params.agentId]
-    );
-    if (rows.length === 0) return res.status(404).json({ error: 'Agent not found' });
-    res.json(rows[0]);
-  } catch (err) {
-    console.error('Admin get location error:', err);
-    res.status(500).json({ error: 'Failed to load location' });
-  }
-});
-
-// Approve / revoke an agent's location
 router.put('/:agentId/verify-location', authenticate, async (req, res) => {
   try {
     if (req.user.user_type !== 'admin') {
       return res.status(403).json({ error: 'Admin only' });
     }
     const { is_verified } = req.body;
+
+    if (is_verified) {
+      const agentRow = await pool.query(
+        `SELECT ST_Y(location::geometry) AS lat,
+                ST_X(location::geometry) AS lng
+         FROM agents WHERE id = $1`,
+        [req.params.agentId]
+      );
+      const lat = agentRow.rows[0]?.lat;
+      const lng = agentRow.rows[0]?.lng;
+
+      if (lat == null || lng == null) {
+        return res.status(400).json({
+          error: 'Cannot verify — agent has no location set',
+        });
+      }
+
+      const newHexId = latLngToHex(Number(lat), Number(lng));
+      console.log(`[verify-location] recalculated hex_id ${newHexId} for agent ${req.params.agentId}`);
+
+      const { rows } = await pool.query(
+        `UPDATE agents
+         SET is_location_verified = true,
+             hex_id = $1,
+             updated_at = NOW()
+         WHERE id = $2
+         RETURNING id, is_location_verified, hex_id`,
+        [newHexId, req.params.agentId]
+      );
+      return res.json({ success: true, agent: rows[0] });
+    }
+
     const { rows } = await pool.query(
       `UPDATE agents
-       SET is_location_verified = $1, updated_at = NOW()
-       WHERE id = $2
-       RETURNING id, is_location_verified`,
-      [!!is_verified, req.params.agentId]
+       SET is_location_verified = false, updated_at = NOW()
+       WHERE id = $1
+       RETURNING id, is_location_verified, hex_id`,
+      [req.params.agentId]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Agent not found' });
     res.json({ success: true, agent: rows[0] });

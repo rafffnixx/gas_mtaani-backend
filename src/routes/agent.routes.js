@@ -220,7 +220,7 @@ router.get('/business', authenticate, isAgent, async (req, res) => {
     const { rows } = await pool.query(
       `SELECT business_name, business_registration_number, kra_pin, id_number,
               business_license_url, profile_photo_url, service_radius,
-              is_approved, approval_date
+              is_approved, approval_date, is_location_verified, verification_status
        FROM agents WHERE id = $1`,
       [req.user.id]
     );
@@ -258,7 +258,7 @@ router.put('/business', authenticate, isAgent, async (req, res) => {
            updated_at                   = NOW()
        WHERE id = $6
        RETURNING business_name, business_registration_number, kra_pin, id_number,
-                 business_license_url, profile_photo_url`,
+                 business_license_url, profile_photo_url, is_location_verified, verification_status`,
       [
         business_name.trim(),
         business_registration_number?.trim() || null,

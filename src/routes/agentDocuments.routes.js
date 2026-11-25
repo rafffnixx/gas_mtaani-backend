@@ -107,6 +107,28 @@ router.post('/upload-docs', authenticate, upload.single('file'), async (req, res
 });
 
 // =====================================================
+// POST /api/agents/profile-photo
+// Upload a shop profile picture
+// =====================================================
+router.post('/profile-photo', authenticate, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'file is required' });
+
+    const publicUrl = publicUrlFor(req, req.file.filename);
+
+    const { rows } = await pool.query(
+      `UPDATE agents SET profile_photo_url = $1 WHERE id = $2 RETURNING profile_photo_url`,
+      [publicUrl, req.user.id]
+    );
+
+    res.json({ success: true, url: rows[0].profile_photo_url });
+  } catch (err) {
+    console.error('POST /agents/profile-photo error:', err);
+    res.status(500).json({ error: err.message || 'Failed to upload profile photo' });
+  }
+});
+
+// =====================================================
 // POST /api/agents/submit-application
 // =====================================================
 router.post('/submit-application', authenticate, async (req, res) => {
